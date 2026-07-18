@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -10,6 +11,8 @@ import (
 
 type Config struct {
 	Addr            string
+	ControlAddr     string
+	ControlSecret   string
 	JWTSecret       string
 	AllowedOrigins  map[string]struct{}
 	PublicIP        string
@@ -24,6 +27,8 @@ type Config struct {
 func Load() (Config, error) {
 	cfg := Config{
 		Addr:            env("TARNMEDIA_ADDR", ":8088"),
+		ControlAddr:     env("TARNMEDIA_CONTROL_ADDR", "127.0.0.1:8089"),
+		ControlSecret:   strings.TrimSpace(os.Getenv("TARNMEDIA_CONTROL_SECRET")),
 		JWTSecret:       strings.TrimSpace(os.Getenv("TARNMEDIA_JWT_SECRET")),
 		PublicIP:        strings.TrimSpace(os.Getenv("TARNMEDIA_PUBLIC_IP")),
 		ICEURLs:         splitCSV(os.Getenv("TARNMEDIA_ICE_URLS")),
@@ -38,6 +43,13 @@ func Load() (Config, error) {
 	}
 	if len(cfg.JWTSecret) < 32 {
 		return Config{}, fmt.Errorf("TARNMEDIA_JWT_SECRET must be at least 32 characters")
+	}
+	if len(cfg.ControlSecret) < 32 {
+		return Config{}, fmt.Errorf("TARNMEDIA_CONTROL_SECRET must be at least 32 characters")
+	}
+	host, _, err := net.SplitHostPort(cfg.ControlAddr)
+	if err != nil || (host != "127.0.0.1" && host != "::1" && host != "localhost") {
+		return Config{}, fmt.Errorf("TARNMEDIA_CONTROL_ADDR must listen on loopback only")
 	}
 	if cfg.MaxPeersPerRoom < 2 || cfg.MaxPeersPerRoom > 100 {
 		return Config{}, fmt.Errorf("TARNMEDIA_MAX_PEERS_PER_ROOM must be between 2 and 100")

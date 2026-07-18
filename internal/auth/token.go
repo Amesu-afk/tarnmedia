@@ -20,6 +20,7 @@ type Claims struct {
 	Username      string `json:"username"`
 	DisplayName   string `json:"displayName"`
 	AvatarURL     string `json:"avatarUrl,omitempty"`
+	IssuedAtMS    int64  `json:"issuedAtMs"`
 	jwt.RegisteredClaims
 }
 
@@ -47,6 +48,12 @@ func Parse(raw, secret string) (Claims, error) {
 	}
 	if claims.Subject == "" || claims.UserID != claims.Subject {
 		return Claims{}, errors.New("invalid media token subject")
+	}
+	if claims.IssuedAt == nil {
+		return Claims{}, errors.New("media token has no issue time")
+	}
+	if claims.IssuedAtMS <= 0 {
+		return Claims{}, errors.New("media token has no precise issue time")
 	}
 	if !validIdentifier(claims.Room, 180) || !validIdentifier(claims.ParticipantID, 180) {
 		return Claims{}, errors.New("invalid room or participant identifier")

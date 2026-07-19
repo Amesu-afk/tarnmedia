@@ -152,9 +152,8 @@ func New(cfg config.Config) (*Server, error) {
 	if err := settings.SetEphemeralUDPPortRange(cfg.UDPMin, cfg.UDPMax); err != nil {
 		return nil, fmt.Errorf("configure UDP port range: %w", err)
 	}
-	// The production SFU has no IPv6 route. Restrict ICE gathering to the
-	// IPv4 UDP transport advertised by TARNMEDIA_PUBLIC_IP so a failed IPv6
-	// route lookup cannot abort renegotiation for the whole PeerConnection.
+	// The production media endpoint is IPv4-only, so gather only the UDP
+	// candidates that can be advertised through TARNMEDIA_PUBLIC_IP.
 	settings.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
 	if cfg.PublicIP != "" {
 		settings.SetNAT1To1IPs([]string{cfg.PublicIP}, webrtc.ICECandidateTypeHost)

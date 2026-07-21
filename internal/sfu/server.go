@@ -1,6 +1,7 @@
 package sfu
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -46,14 +47,17 @@ type serverMetrics struct {
 }
 
 type revocation struct {
-	revokedAt time.Time
-	expiresAt time.Time
+	revokedAt               time.Time
+	expiresAt               time.Time
+	minActiveSessionVersion int
+	hasActiveSessionVersion bool
 }
 
 type Server struct {
 	cfg      config.Config
 	api      *webrtc.API
 	pcConfig webrtc.Configuration
+	authHTTP *http.Client
 	upgrader websocket.Upgrader
 
 	mu          sync.RWMutex
@@ -137,6 +141,7 @@ type controlCommand struct {
 	Room            string `json:"room"`
 	UserID          string `json:"userId,omitempty"`
 	RevokedBeforeMS int64  `json:"revokedBeforeMs"`
+	SessionVersion  *int   `json:"sessionVersion,omitempty"`
 }
 
 func New(cfg config.Config) (*Server, error) {
@@ -176,6 +181,7 @@ func New(cfg config.Config) (*Server, error) {
 			webrtc.WithSettingEngine(settings),
 		),
 		pcConfig:    pcConfig,
+		authHTTP:    &http.Client{Timeout: 2 * time.Second},
 		rooms:       make(map[string]*room),
 		revocations: make(map[string]revocation),
 	}
@@ -297,7 +303,7 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	command := controlCommand{}
-	if err := decoder.Decode(&command); err != nil || !validControlIdentifier(command.Room, 180) {
+	if err := decoder.Decode(&command); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid control command"})
 		return
 	}
@@ -310,19 +316,65 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 	}
 	switch command.Action {
 	case "closeRoom":
+		if !validControlIdentifier(command.Room, 180) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid room"})
+			return
+		}
 		affected = s.closeRoom(command.Room, revokedAt)
 	case "evictUser":
-		if !validControlIdentifier(command.UserID, 180) {
+		if !validControlIdentifier(command.Room, 180) || !validControlIdentifier(command.UserID, 180) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid user"})
 			return
 		}
 		affected = s.evictUser(command.Room, command.UserID, revokedAt)
+	case "revokeUser":
+		if !validControlIdentifier(command.UserID, 180) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid user"})
+			return
+		}
+		if command.SessionVersion != nil && *command.SessionVersion < 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid session version"})
+			return
+		}
+		affected = s.revokeUser(command.UserID, revokedAt, command.SessionVersion)
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported action"})
 		return
 	}
 	s.metrics.evictedPeers.Add(uint64(affected))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affectedPeers": affected})
+}
+
+// revokeUser applies to every room. Global password changes and account bans
+// cannot reliably enumerate a user's current DM/call rooms at the API layer.
+func (s *Server) revokeUser(userID string, revokedAt time.Time, activeSessionVersion *int) int {
+	now := time.Now()
+	item := revocation{revokedAt: revokedAt, expiresAt: now.Add(revocationRetention)}
+	if activeSessionVersion != nil {
+		item.minActiveSessionVersion = *activeSessionVersion
+		item.hasActiveSessionVersion = true
+	}
+	s.mu.Lock()
+	s.revocations[revocationKey("", userID)] = item
+	rooms := make([]*room, 0, len(s.rooms))
+	for _, current := range s.rooms {
+		rooms = append(rooms, current)
+	}
+	s.mu.Unlock()
+
+	affected := 0
+	for _, current := range rooms {
+		removed, empty := current.removeUser(userID)
+		affected += removed
+		if empty {
+			s.mu.Lock()
+			if s.rooms[current.id] == current {
+				delete(s.rooms, current.id)
+			}
+			s.mu.Unlock()
+		}
+	}
+	return affected
 }
 
 func (s *Server) controlAuthorized(header string) bool {
@@ -393,9 +445,13 @@ func (s *Server) tokenRevoked(claims auth.Claims) bool {
 	s.mu.RLock()
 	roomRevocation, roomRevoked := s.revocations[revocationKey(claims.Room, "")]
 	userRevocation, userRevoked := s.revocations[revocationKey(claims.Room, claims.UserID)]
+	globalRevocation, globallyRevoked := s.revocations[revocationKey("", claims.UserID)]
 	s.mu.RUnlock()
+	globalInvalid := globallyRevoked && ((!globalRevocation.hasActiveSessionVersion && !issuedAt.After(globalRevocation.revokedAt)) ||
+		(globalRevocation.hasActiveSessionVersion && claims.SessionVersion < globalRevocation.minActiveSessionVersion))
 	return (roomRevoked && !issuedAt.After(roomRevocation.revokedAt)) ||
-		(userRevoked && !issuedAt.After(userRevocation.revokedAt))
+		(userRevoked && !issuedAt.After(userRevocation.revokedAt)) ||
+		globalInvalid
 }
 
 func (s *Server) cleanupRevocations() {
@@ -517,7 +573,42 @@ func (s *Server) authenticate(conn *websocket.Conn) (auth.Claims, error) {
 	if err := json.Unmarshal(message.Data, &data); err != nil || data.Token == "" {
 		return auth.Claims{}, errors.New("media token required")
 	}
-	return auth.Parse(data.Token, s.cfg.JWTSecret)
+	claims, err := auth.Parse(data.Token, s.cfg.JWTSecret)
+	if err != nil {
+		return auth.Claims{}, err
+	}
+	if err := s.validateSession(claims); err != nil {
+		return auth.Claims{}, err
+	}
+	return claims, nil
+}
+
+// validateSession keeps the SFU stateless with respect to user accounts while
+// still making a JWT revocable after a password change or ban. The endpoint
+// is loopback-only in normal deployment and requires the control secret.
+func (s *Server) validateSession(claims auth.Claims) error {
+	body, err := json.Marshal(struct {
+		UserID         string `json:"userId"`
+		SessionVersion int    `json:"sessionVersion"`
+	}{UserID: claims.UserID, SessionVersion: claims.SessionVersion})
+	if err != nil {
+		return errors.New("media session validation failed")
+	}
+	req, err := http.NewRequest(http.MethodPost, s.cfg.AuthURL, bytes.NewReader(body))
+	if err != nil {
+		return errors.New("media session validation is unavailable")
+	}
+	req.Header.Set("Authorization", "Bearer "+s.cfg.ControlSecret)
+	req.Header.Set("Content-Type", "application/json")
+	response, err := s.authHTTP.Do(req)
+	if err != nil {
+		return errors.New("media session validation is unavailable")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		return errors.New("media session is no longer active")
+	}
+	return nil
 }
 
 func (s *Server) join(claims auth.Claims, conn *websocket.Conn) (*peer, error) {

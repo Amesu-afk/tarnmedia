@@ -13,6 +13,7 @@ type Config struct {
 	Addr            string
 	ControlAddr     string
 	ControlSecret   string
+	AuthURL         string
 	JWTSecret       string
 	AllowedOrigins  map[string]struct{}
 	PublicIP        string
@@ -29,6 +30,7 @@ func Load() (Config, error) {
 		Addr:            env("TARNMEDIA_ADDR", ":8088"),
 		ControlAddr:     env("TARNMEDIA_CONTROL_ADDR", "127.0.0.1:8089"),
 		ControlSecret:   strings.TrimSpace(os.Getenv("TARNMEDIA_CONTROL_SECRET")),
+		AuthURL:         env("TARNMEDIA_AUTH_URL", "http://127.0.0.1:3001/internal/tarnmedia/validate"),
 		JWTSecret:       strings.TrimSpace(os.Getenv("TARNMEDIA_JWT_SECRET")),
 		PublicIP:        strings.TrimSpace(os.Getenv("TARNMEDIA_PUBLIC_IP")),
 		ICEURLs:         splitCSV(os.Getenv("TARNMEDIA_ICE_URLS")),
@@ -50,6 +52,13 @@ func Load() (Config, error) {
 	host, _, err := net.SplitHostPort(cfg.ControlAddr)
 	if err != nil || (host != "127.0.0.1" && host != "::1" && host != "localhost") {
 		return Config{}, fmt.Errorf("TARNMEDIA_CONTROL_ADDR must listen on loopback only")
+	}
+	authURL, err := url.Parse(cfg.AuthURL)
+	if err != nil || authURL.Scheme == "" || authURL.Host == "" || authURL.Fragment != "" || authURL.User != nil {
+		return Config{}, fmt.Errorf("TARNMEDIA_AUTH_URL must be a valid URL")
+	}
+	if authURL.Scheme != "https" && !(authURL.Scheme == "http" && isLoopbackHost(authURL.Hostname())) {
+		return Config{}, fmt.Errorf("TARNMEDIA_AUTH_URL must use HTTPS or loopback HTTP")
 	}
 	if cfg.MaxPeersPerRoom < 2 || cfg.MaxPeersPerRoom > 100 {
 		return Config{}, fmt.Errorf("TARNMEDIA_MAX_PEERS_PER_ROOM must be between 2 and 100")
@@ -88,6 +97,10 @@ func (c Config) OriginAllowed(raw string) bool {
 	}
 	_, ok := c.AllowedOrigins[u.Scheme+"://"+u.Host]
 	return ok
+}
+
+func isLoopbackHost(host string) bool {
+	return host == "127.0.0.1" || host == "::1" || host == "localhost"
 }
 
 func env(name, fallback string) string {

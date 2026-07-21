@@ -14,13 +14,14 @@ const (
 )
 
 type Claims struct {
-	Room          string `json:"room"`
-	ParticipantID string `json:"participantId"`
-	UserID        string `json:"userId"`
-	Username      string `json:"username"`
-	DisplayName   string `json:"displayName"`
-	AvatarURL     string `json:"avatarUrl,omitempty"`
-	IssuedAtMS    int64  `json:"issuedAtMs"`
+	Room           string `json:"room"`
+	ParticipantID  string `json:"participantId"`
+	UserID         string `json:"userId"`
+	SessionVersion int    `json:"sessionVersion"`
+	Username       string `json:"username"`
+	DisplayName    string `json:"displayName"`
+	AvatarURL      string `json:"avatarUrl,omitempty"`
+	IssuedAtMS     int64  `json:"issuedAtMs"`
 	jwt.RegisteredClaims
 }
 
@@ -54,6 +55,9 @@ func Parse(raw, secret string) (Claims, error) {
 	}
 	if claims.IssuedAtMS <= 0 {
 		return Claims{}, errors.New("media token has no precise issue time")
+	}
+	if claims.SessionVersion < 0 {
+		return Claims{}, errors.New("media token has an invalid session version")
 	}
 	if !validIdentifier(claims.Room, 180) || !validIdentifier(claims.ParticipantID, 180) {
 		return Claims{}, errors.New("invalid room or participant identifier")

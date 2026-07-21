@@ -63,6 +63,63 @@ func TestCloseRoomRevokesAlreadyIssuedTokens(t *testing.T) {
 	}
 }
 
+func TestRevokeUserRevokesTokensAcrossRooms(t *testing.T) {
+	server := testServer(t)
+	issuedAt := time.Now().Add(-time.Second)
+	claims := auth.Claims{
+		Room: "room-2", UserID: "user-1", SessionVersion: 3, IssuedAtMS: issuedAt.UnixMilli(),
+		RegisteredClaims: jwt.RegisteredClaims{IssuedAt: jwt.NewNumericDate(issuedAt)},
+	}
+	body := []byte(fmt.Sprintf(`{"action":"revokeUser","userId":"user-1","revokedBeforeMs":%d,"sessionVersion":4}`, time.Now().UnixMilli()))
+	request := httptest.NewRequest(http.MethodPost, "/v1/control", bytes.NewReader(body))
+	request.Header.Set("Authorization", "Bearer control-secret-that-is-long-enough-for-tests")
+	response := httptest.NewRecorder()
+	server.ControlHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+	if !server.tokenRevoked(claims) {
+		t.Fatal("global user revocation must reject a token from any room")
+	}
+	freshClaims := claims
+	freshClaims.SessionVersion = 4
+	if server.tokenRevoked(freshClaims) {
+		t.Fatal("current session version must remain valid even if it was issued in the same millisecond as revocation")
+	}
+}
+
+func TestValidateSessionRequiresCurrentAPISession(t *testing.T) {
+	server := testServer(t)
+	validator := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.Header.Get("Authorization") != "Bearer control-secret-that-is-long-enough-for-tests" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer validator.Close()
+	server.cfg.AuthURL = validator.URL
+	server.authHTTP = validator.Client()
+
+	if err := server.validateSession(auth.Claims{UserID: "user-1", SessionVersion: 2}); err != nil {
+		t.Fatalf("expected current API session to be accepted: %v", err)
+	}
+}
+
+func TestValidateSessionFailsClosed(t *testing.T) {
+	server := testServer(t)
+	validator := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer validator.Close()
+	server.cfg.AuthURL = validator.URL
+	server.authHTTP = validator.Client()
+
+	if err := server.validateSession(auth.Claims{UserID: "user-1", SessionVersion: 2}); err == nil {
+		t.Fatal("revoked API session must be rejected")
+	}
+}
+
 func TestMetricsAreAvailableOnControlHandler(t *testing.T) {
 	server := testServer(t)
 	server.SetReady(true)

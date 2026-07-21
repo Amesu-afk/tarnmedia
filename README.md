@@ -20,8 +20,7 @@ The first slice supports:
 The browser transport is now integrated behind `/media/session`. It supports
 microphone, camera, screen sharing, device changes, participant volume, speaking
 detection, connection statistics, token-refresh reconnects and client-side TURN.
-`MEDIA_BACKEND=livekit` remains the safe base while canary rooms are moved with
-`TARNMEDIA_ROLLOUT_ROOMS` or stable room-level percentage bucketing.
+TarnMedia is the only server media backend.
 
 ## Local run
 
@@ -64,35 +63,24 @@ forwarding without permission dialogs. Use only short-lived local test tokens;
 the page is a development harness and is not part of the production Vite build.
 
 For a real application test, use matching `TARNMEDIA_JWT_SECRET` values in the
-main server and TarnMedia, set:
+main server and TarnMedia, then set:
 
 ```text
-MEDIA_BACKEND=tarnmedia
 TARNMEDIA_PUBLIC_URL=ws://127.0.0.1:8088/v1/ws
 ```
 
 then start TarnMedia, the main server and two clients. For local tests without
-coturn, leave `TARNMEDIA_TURN_URLS` empty. Switch back to `MEDIA_BACKEND=livekit`
-without rebuilding the client if rollback is needed.
+coturn, leave `TARNMEDIA_TURN_URLS` empty.
 
-## Production deployment and rollout
+## Production deployment
 
-Run `deploy/deploy-tarnmedia.sh` from Git Bash. It cross-compiles the service,
-installs the hardened systemd unit, configures coturn with expiring REST
-credentials, adds the `/media-sfu/*` Caddy route, opens only the required ports
-and verifies health/metrics. The setup leaves the rollout at zero by default.
+Run `deploy/deploy.sh` from Git Bash. It type-checks and tests the application,
+cross-compiles TarnMedia, installs the SFU binary, restarts both services and
+checks the public `/media-sfu/health` endpoint.
 
-Roll out in this order:
-
-1. Keep `MEDIA_BACKEND=livekit` and `TARNMEDIA_ROLLOUT_PERCENT=0` while checking
-   the dark-launched service.
-2. Put one real voice channel ID in `TARNMEDIA_ROLLOUT_ROOMS`, restart the main
-   server, and test from two physical devices on different networks.
-3. Remove the explicit room and raise `TARNMEDIA_ROLLOUT_PERCENT` gradually
-   (for example 5, 25, 50, 100). Bucketing is deterministic by room, so all
-   participants always meet on the same SFU.
-4. Roll back immediately by setting the percentage to zero and clearing the room
-   allowlist; existing TarnMedia calls can be disconnected through the control API.
+Before production use, verify a call between two physical devices on different
+networks, including TURN fallback. Roll back by deploying a previously verified
+TarnMedia build.
 
 Simulcast/SVC layer selection and sustained load tests remain the next capacity
 milestone before calling the video path fully mature for large rooms.

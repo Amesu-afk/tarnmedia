@@ -10,7 +10,7 @@ import (
 func TestParseAcceptsScopedToken(t *testing.T) {
 	secret := "test-secret-that-is-long-enough-for-hs256"
 	claims := Claims{
-		Room: "voice-room", ParticipantID: "user-1__device", UserID: "user-1", Username: "alice", IssuedAtMS: time.Now().UnixMilli(),
+		Room: "voice-room", ParticipantID: "user-1__device", UserID: "user-1", SessionVersion: 2, Username: "alice", IssuedAtMS: time.Now().UnixMilli(),
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject: "user-1", Issuer: Issuer, Audience: jwt.ClaimStrings{Audience},
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
@@ -33,7 +33,7 @@ func TestParseAcceptsScopedToken(t *testing.T) {
 func TestParseRejectsWrongRoomTokenAudience(t *testing.T) {
 	secret := "test-secret-that-is-long-enough-for-hs256"
 	claims := Claims{
-		Room: "voice-room", ParticipantID: "peer", UserID: "user-1", Username: "alice", IssuedAtMS: time.Now().UnixMilli(),
+		Room: "voice-room", ParticipantID: "peer", UserID: "user-1", SessionVersion: 2, Username: "alice", IssuedAtMS: time.Now().UnixMilli(),
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject: "user-1", Issuer: Issuer, Audience: jwt.ClaimStrings{"another-service"},
 			IssuedAt:  jwt.NewNumericDate(time.Now()),

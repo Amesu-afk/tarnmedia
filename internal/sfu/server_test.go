@@ -2,6 +2,7 @@ package sfu
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -132,5 +133,71 @@ func TestMetricsAreAvailableOnControlHandler(t *testing.T) {
 	}
 	if response.Code != http.StatusOK || !strings.Contains(string(body), "tarnmedia_ready 1") {
 		t.Fatalf("unexpected metrics response: %d %s", response.Code, body)
+	}
+}
+
+func TestStateSignalSetsMicTransmitting(t *testing.T) {
+	tests := []struct {
+		name             string
+		data             string
+		wantTransmitting bool
+	}{
+		{
+			name:             "new client starts transmitting",
+			data:             `{"micMuted":false,"micTransmitting":true}`,
+			wantTransmitting: true,
+		},
+		{
+			name:             "new client reports PTT or VAD closed",
+			data:             `{"micMuted":false,"micTransmitting":false}`,
+			wantTransmitting: false,
+		},
+		{
+			name:             "legacy client omits transmission field",
+			data:             `{"micMuted":false}`,
+			wantTransmitting: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			peer := &peer{room: &room{}}
+			if err := peer.handleSignal(signalMessage{Event: "state", Data: json.RawMessage(test.data)}); err != nil {
+				t.Fatal(err)
+			}
+			if got := peer.allowsPacketForwarding("microphone"); got != test.wantTransmitting {
+				t.Fatalf("microphone forwarding = %t, want %t", got, test.wantTransmitting)
+			}
+		})
+	}
+}
+
+func TestMicrophonePacketsRequireUnmutedTransmittingState(t *testing.T) {
+	peer := &peer{}
+	if peer.allowsPacketForwarding("microphone") {
+		t.Fatal("microphone packets must be blocked until the client reports transmission")
+	}
+
+	peer.state.MicTransmitting = true
+	if !peer.allowsPacketForwarding("microphone") {
+		t.Fatal("an unmuted, transmitting microphone must be forwarded")
+	}
+
+	peer.state.MicMuted = true
+	if peer.allowsPacketForwarding("microphone") {
+		t.Fatal("a muted microphone must be blocked before RTP forwarding")
+	}
+	if !peer.allowsPacketForwarding("camera") || !peer.allowsPacketForwarding("screen") {
+		t.Fatal("mute must not block camera or screen packets")
+	}
+
+	peer.state.MicMuted = false
+	if !peer.allowsPacketForwarding("microphone") {
+		t.Fatal("microphone packets must resume immediately after unmute while transmitting")
+	}
+
+	peer.state.MicTransmitting = false
+	if peer.allowsPacketForwarding("microphone") {
+		t.Fatal("microphone packets must stop when PTT or VAD closes transmission")
 	}
 }

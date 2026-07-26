@@ -77,9 +77,19 @@ type authenticateData struct {
 }
 
 type mediaState struct {
-	MicMuted bool `json:"micMuted"`
-	CameraOn bool `json:"cameraOn"`
-	ScreenOn bool `json:"screenOn"`
+	MicMuted        bool `json:"micMuted"`
+	MicTransmitting bool `json:"micTransmitting"`
+	CameraOn        bool `json:"cameraOn"`
+	ScreenOn        bool `json:"screenOn"`
+}
+
+// incomingMediaState retains whether a newer client explicitly reported its
+// effective PTT/VAD transmission state. Older clients omit MicTransmitting.
+type incomingMediaState struct {
+	MicMuted        bool  `json:"micMuted"`
+	MicTransmitting *bool `json:"micTransmitting"`
+	CameraOn        bool  `json:"cameraOn"`
+	ScreenOn        bool  `json:"screenOn"`
 }
 
 type participantView struct {
@@ -622,7 +632,8 @@ func (s *Server) join(claims auth.Claims, conn *websocket.Conn) (*peer, error) {
 	currentPeer := &peer{
 		id: claims.ParticipantID, claims: claims, pc: pc, ws: conn,
 		receiveSources: make(map[*webrtc.RTPReceiver]string),
-		state:          mediaState{MicMuted: true},
+		// Block microphone RTP until the client reports its initial media state.
+		state: mediaState{MicMuted: true, MicTransmitting: false},
 	}
 
 	for _, input := range []struct {
@@ -772,6 +783,14 @@ func (r *room) forward(owner *peer, remote *webrtc.TrackRemote, source string) {
 		packet, _, err := remote.ReadRTP()
 		if err != nil {
 			return
+		}
+		// MediaStreamTrack.enabled is the first mute barrier, but some WebView /
+		// device combinations can keep producing RTP while that state propagates.
+		// Do not let manual mute or the effective PTT/VAD policy feed speaker audio
+		// back to the other participants. Keep the sender and its negotiated track
+		// alive: removing it here would force an SDP renegotiation on every toggle.
+		if !owner.allowsPacketForwarding(source) {
+			continue
 		}
 		packet.Extension = false
 		packet.Extensions = nil
@@ -1019,8 +1038,8 @@ func (p *peer) handleSignal(message signalMessage) error {
 		}
 		return nil
 	case "state":
-		state := mediaState{}
-		if err := json.Unmarshal(message.Data, &state); err != nil {
+		state, err := decodeMediaState(message.Data)
+		if err != nil {
 			return errors.New("invalid participant media state")
 		}
 		p.stateMu.Lock()
@@ -1032,6 +1051,27 @@ func (p *peer) handleSignal(message signalMessage) error {
 	default:
 		return fmt.Errorf("unsupported signaling event %q", message.Event)
 	}
+}
+
+func decodeMediaState(data json.RawMessage) (mediaState, error) {
+	incoming := incomingMediaState{}
+	if err := json.Unmarshal(data, &incoming); err != nil {
+		return mediaState{}, err
+	}
+
+	// A state message from an already-shipped client has no micTransmitting
+	// field. Treat it as transmitting to preserve its pre-upgrade behavior;
+	// newly joined peers are still fail-closed before any state is received.
+	state := mediaState{
+		MicMuted:        incoming.MicMuted,
+		MicTransmitting: true,
+		CameraOn:        incoming.CameraOn,
+		ScreenOn:        incoming.ScreenOn,
+	}
+	if incoming.MicTransmitting != nil {
+		state.MicTransmitting = *incoming.MicTransmitting
+	}
+	return state, nil
 }
 
 func (p *peer) participantView() participantView {
@@ -1063,6 +1103,20 @@ func (p *peer) sourceActive(source string) bool {
 		return p.state.ScreenOn
 	}
 	return false
+}
+
+// allowsPacketForwarding is deliberately separate from sourceActive. A
+// microphone remains negotiated so it can resume immediately, but no RTP from
+// it may reach other peers unless the participant is both unmuted and actively
+// transmitting. MicTransmitting defaults to false, so a newly joined peer
+// cannot leak audio before its client reports the effective PTT/VAD state.
+func (p *peer) allowsPacketForwarding(source string) bool {
+	if source != "microphone" {
+		return true
+	}
+	p.stateMu.RLock()
+	defer p.stateMu.RUnlock()
+	return !p.state.MicMuted && p.state.MicTransmitting
 }
 
 func (p *peer) write(event string, data any) error {

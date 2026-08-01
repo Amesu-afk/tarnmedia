@@ -1,5 +1,7 @@
 # TarnMedia
 
+**English** · [Русский](README.ru.md)
+
 A small, readable WebRTC SFU written in Go on top of [Pion](https://github.com/pion/webrtc).
 It forwards audio, camera and screen-share tracks between participants of a room,
 authorizes them with JWTs issued by *your* application, and does nothing else.

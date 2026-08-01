@@ -7,6 +7,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/tarnveil/tarnmedia/internal/auth"
 )
 
 type Config struct {
@@ -15,6 +17,7 @@ type Config struct {
 	ControlSecret   string
 	AuthURL         string
 	JWTSecret       string
+	Issuer          string
 	AllowedOrigins  map[string]struct{}
 	PublicIP        string
 	UDPMin          uint16
@@ -58,6 +61,7 @@ func Load() (Config, error) {
 		ControlSecret:   strings.TrimSpace(os.Getenv("TARNMEDIA_CONTROL_SECRET")),
 		AuthURL:         env("TARNMEDIA_AUTH_URL", "http://127.0.0.1:3001/internal/tarnmedia/validate"),
 		JWTSecret:       strings.TrimSpace(os.Getenv("TARNMEDIA_JWT_SECRET")),
+		Issuer:          env("TARNMEDIA_ISSUER", auth.DefaultIssuer),
 		PublicIP:        strings.TrimSpace(os.Getenv("TARNMEDIA_PUBLIC_IP")),
 		ICEURLs:         splitCSV(os.Getenv("TARNMEDIA_ICE_URLS")),
 		ICEUsername:     os.Getenv("TARNMEDIA_ICE_USERNAME"),
@@ -103,7 +107,9 @@ func Load() (Config, error) {
 	}
 	cfg.UDPMin, cfg.UDPMax = min, max
 
-	for _, origin := range splitCSV(env("TARNMEDIA_ALLOWED_ORIGINS", "https://tarnveil.ru,https://www.tarnveil.ru,http://localhost:5173,http://127.0.0.1:5173,http://tauri.localhost")) {
+	// The default covers local development only. Every deployment is expected to
+	// pass its own public origins through TARNMEDIA_ALLOWED_ORIGINS.
+	for _, origin := range splitCSV(env("TARNMEDIA_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")) {
 		u, err := url.Parse(origin)
 		if err != nil || u.Scheme == "" || u.Host == "" || u.Path != "" {
 			return Config{}, fmt.Errorf("invalid origin in TARNMEDIA_ALLOWED_ORIGINS: %q", origin)

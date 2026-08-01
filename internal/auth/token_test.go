@@ -12,7 +12,7 @@ func TestParseAcceptsScopedToken(t *testing.T) {
 	claims := Claims{
 		Room: "voice-room", ParticipantID: "user-1__device", UserID: "user-1", SessionVersion: 2, Username: "alice", IssuedAtMS: time.Now().UnixMilli(),
 		RegisteredClaims: jwt.RegisteredClaims{
-			Subject: "user-1", Issuer: Issuer, Audience: jwt.ClaimStrings{Audience},
+			Subject: "user-1", Issuer: DefaultIssuer, Audience: jwt.ClaimStrings{Audience},
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Minute)),
 		},
@@ -21,7 +21,7 @@ func TestParseAcceptsScopedToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsed, err := Parse(raw, secret)
+	parsed, err := Parse(raw, secret, DefaultIssuer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestParseRejectsWrongRoomTokenAudience(t *testing.T) {
 	claims := Claims{
 		Room: "voice-room", ParticipantID: "peer", UserID: "user-1", SessionVersion: 2, Username: "alice", IssuedAtMS: time.Now().UnixMilli(),
 		RegisteredClaims: jwt.RegisteredClaims{
-			Subject: "user-1", Issuer: Issuer, Audience: jwt.ClaimStrings{"another-service"},
+			Subject: "user-1", Issuer: DefaultIssuer, Audience: jwt.ClaimStrings{"another-service"},
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Minute)),
 		},
@@ -44,7 +44,29 @@ func TestParseRejectsWrongRoomTokenAudience(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Parse(raw, secret); err == nil {
+	if _, err := Parse(raw, secret, DefaultIssuer); err == nil {
 		t.Fatal("expected token with wrong audience to be rejected")
+	}
+}
+
+func TestParseRejectsForeignIssuer(t *testing.T) {
+	secret := "test-secret-that-is-long-enough-for-hs256"
+	claims := Claims{
+		Room: "voice-room", ParticipantID: "peer", UserID: "user-1", SessionVersion: 2, Username: "alice", IssuedAtMS: time.Now().UnixMilli(),
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject: "user-1", Issuer: "some-other-app", Audience: jwt.ClaimStrings{Audience},
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Minute)),
+		},
+	}
+	raw, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Parse(raw, secret, "my-app"); err == nil {
+		t.Fatal("expected token from another issuer to be rejected")
+	}
+	if _, err := Parse(raw, secret, "some-other-app"); err != nil {
+		t.Fatalf("expected configured issuer to be accepted: %v", err)
 	}
 }

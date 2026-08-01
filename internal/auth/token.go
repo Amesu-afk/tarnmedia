@@ -9,8 +9,10 @@ import (
 )
 
 const (
+	// Audience is the fixed `aud` claim this service accepts.
 	Audience = "tarnmedia"
-	Issuer   = "tarnveil-server"
+	// DefaultIssuer is used when the deployment does not set TARNMEDIA_ISSUER.
+	DefaultIssuer = "tarnveil-server"
 )
 
 type Claims struct {
@@ -25,9 +27,12 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
-func Parse(raw, secret string) (Claims, error) {
+func Parse(raw, secret, issuer string) (Claims, error) {
 	if len(raw) > 8192 {
 		return Claims{}, errors.New("token is too large")
+	}
+	if issuer == "" {
+		issuer = DefaultIssuer
 	}
 	claims := Claims{}
 	token, err := jwt.ParseWithClaims(
@@ -40,7 +45,7 @@ func Parse(raw, secret string) (Claims, error) {
 			return []byte(secret), nil
 		},
 		jwt.WithAudience(Audience),
-		jwt.WithIssuer(Issuer),
+		jwt.WithIssuer(issuer),
 		jwt.WithExpirationRequired(),
 		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
 	)

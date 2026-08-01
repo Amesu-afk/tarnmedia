@@ -583,7 +583,7 @@ func (s *Server) authenticate(conn *websocket.Conn) (auth.Claims, error) {
 	if err := json.Unmarshal(message.Data, &data); err != nil || data.Token == "" {
 		return auth.Claims{}, errors.New("media token required")
 	}
-	claims, err := auth.Parse(data.Token, s.cfg.JWTSecret)
+	claims, err := auth.Parse(data.Token, s.cfg.JWTSecret, s.cfg.Issuer)
 	if err != nil {
 		return auth.Claims{}, err
 	}

@@ -1,0 +1,9 @@
+# Local configuration. Never commit real secrets; .env.example is the template.
+.env
+.env.*
+!.env.example
+
+# Build output
+/tarnmedia
+/tarnmedia.exe
+/out/

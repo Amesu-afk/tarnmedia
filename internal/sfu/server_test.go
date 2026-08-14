@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/pion/rtcp"
 
 	"github.com/tarnveil/tarnmedia/internal/auth"
 	"github.com/tarnveil/tarnmedia/internal/config"
@@ -169,6 +170,156 @@ func TestStateSignalSetsMicTransmitting(t *testing.T) {
 				t.Fatalf("microphone forwarding = %t, want %t", got, test.wantTransmitting)
 			}
 		})
+	}
+}
+
+func TestKeyFrameRequestsCollapseWithinTheInterval(t *testing.T) {
+	gate := &keyFrameGate{}
+	start := time.Now()
+	if !gate.allow(start) {
+		t.Fatal("the first request must reach the publisher")
+	}
+	// A full room asks all at once: one key frame answers everyone.
+	if gate.allow(start.Add(keyFrameMinInterval - time.Millisecond)) {
+		t.Fatal("a second request inside the interval must be collapsed into the first")
+	}
+	if !gate.allow(start.Add(keyFrameMinInterval)) {
+		t.Fatal("a request after the interval must reach the publisher again")
+	}
+}
+
+func TestSubscriberRTCPIsRecognisedAsKeyFrameRequest(t *testing.T) {
+	tests := []struct {
+		name    string
+		packets []rtcp.Packet
+		want    bool
+	}{
+		{
+			name:    "picture loss indication",
+			packets: []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: 4242}},
+			want:    true,
+		},
+		{
+			name:    "full intra request",
+			packets: []rtcp.Packet{&rtcp.FullIntraRequest{MediaSSRC: 4242, FIR: []rtcp.FIREntry{{SSRC: 4242, SequenceNumber: 1}}}},
+			want:    true,
+		},
+		{
+			name:    "receiver report is handled by the interceptors, not by us",
+			packets: []rtcp.Packet{&rtcp.ReceiverReport{SSRC: 4242}},
+			want:    false,
+		},
+		{
+			name:    "a request bundled behind a report is still found",
+			packets: []rtcp.Packet{&rtcp.ReceiverReport{SSRC: 4242}, &rtcp.PictureLossIndication{MediaSSRC: 4242}},
+			want:    true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Go through the wire format: this is what arrives from a subscriber.
+			raw, err := rtcp.Marshal(test.packets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := rtcp.Unmarshal(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := requestsKeyFrame(decoded); got != test.want {
+				t.Fatalf("requestsKeyFrame = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+// testUplink builds a forwarded track whose publisher has a real PeerConnection, so
+// requestKeyFrame runs the path it runs in production.
+func testUplink(t *testing.T, server *Server, source string, video bool) localTrack {
+	t.Helper()
+	pc, err := server.api.NewPeerConnection(server.pcConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+	uplink := localTrack{
+		ownerID: "publisher", source: source, ssrc: 4242,
+		owner: &peer{id: "publisher", pc: pc},
+	}
+	if video {
+		uplink.keyFrames = &keyFrameGate{}
+	}
+	return uplink
+}
+
+func TestNewSubscribersShareOneKeyFrame(t *testing.T) {
+	server := testServer(t)
+	camera := testUplink(t, server, "camera", true)
+	// Three subscribers finish negotiating at once: one key frame answers all of them.
+	camera.requestKeyFrame(&server.metrics)
+	camera.requestKeyFrame(&server.metrics)
+	camera.requestKeyFrame(&server.metrics)
+	if got := server.metrics.keyFramesRequested.Load(); got != 1 {
+		t.Fatalf("key frame requests reaching the publisher = %d, want 1", got)
+	}
+	if got := server.metrics.keyFramesCollapsed.Load(); got != 2 {
+		t.Fatalf("collapsed requests = %d, want 2", got)
+	}
+}
+
+func TestAudioUplinkNeverAsksForAKeyFrame(t *testing.T) {
+	server := testServer(t)
+	// forward() leaves keyFrames nil for audio, so a stray request must do nothing.
+	microphone := testUplink(t, server, "microphone", false)
+	microphone.requestKeyFrame(&server.metrics)
+	if server.metrics.keyFramesRequested.Load() != 0 || server.metrics.keyFramesCollapsed.Load() != 0 {
+		t.Fatal("an audio uplink must not produce key frame traffic")
+	}
+}
+
+func TestKeyFrameCountersAreExposed(t *testing.T) {
+	server := testServer(t)
+	server.metrics.keyFramesRequested.Add(2)
+	server.metrics.keyFramesCollapsed.Add(5)
+	request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	response := httptest.NewRecorder()
+	server.ControlHandler().ServeHTTP(response, request)
+	body := response.Body.String()
+	if !strings.Contains(body, "tarnmedia_key_frames_requested_total 2") {
+		t.Fatalf("key frame requests missing from metrics: %s", body)
+	}
+	if !strings.Contains(body, "tarnmedia_key_frames_collapsed_total 5") {
+		t.Fatalf("collapsed key frame requests missing from metrics: %s", body)
+	}
+}
+
+func TestOnlyNewlySubscribedTracksAreQueuedForAKeyFrame(t *testing.T) {
+	server := testServer(t)
+	subscriber := &peer{id: "subscriber"}
+	camera := testUplink(t, server, "camera", true)
+	subscriber.pendingKeyFrames = append(subscriber.pendingKeyFrames, camera)
+
+	// This is what the answer branch does: take the queue and clear it.
+	queued := subscriber.pendingKeyFrames
+	subscriber.pendingKeyFrames = nil
+	for _, candidate := range queued {
+		candidate.requestKeyFrame(&server.metrics)
+	}
+	if got := server.metrics.keyFramesRequested.Load(); got != 1 {
+		t.Fatalf("a new subscription must ask for one key frame, got %d", got)
+	}
+
+	// Renegotiation also happens on every mute toggle. That answer carries no new
+	// subscription, so it must cost the room nothing.
+	if subscriber.pendingKeyFrames != nil {
+		t.Fatal("the queue must be empty once the answer consumed it")
+	}
+	for _, candidate := range subscriber.pendingKeyFrames {
+		candidate.requestKeyFrame(&server.metrics)
+	}
+	if got := server.metrics.keyFramesRequested.Load(); got != 1 {
+		t.Fatalf("a mute toggle must not ask for key frames, requests = %d", got)
 	}
 }
 

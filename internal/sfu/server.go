@@ -31,6 +31,11 @@ const (
 	websocketPongWait      = 45 * time.Second
 	websocketPingPeriod    = 15 * time.Second
 	revocationRetention    = 10 * time.Minute
+	// A key frame costs roughly ten delta frames and is paid for by the publisher's
+	// uplink and by every subscriber. In a full room a burst of subscribers can each
+	// ask for one at the same moment, so requests are collapsed per uplink: one key
+	// frame answers all of them.
+	keyFrameMinInterval = 500 * time.Millisecond
 )
 
 type serverMetrics struct {
@@ -44,6 +49,8 @@ type serverMetrics struct {
 	controlRequests      atomic.Uint64
 	controlAuthFailures  atomic.Uint64
 	evictedPeers         atomic.Uint64
+	keyFramesRequested   atomic.Uint64
+	keyFramesCollapsed   atomic.Uint64
 }
 
 type revocation struct {
@@ -114,6 +121,46 @@ type localTrack struct {
 	ownerID string
 	source  string
 	track   *webrtc.TrackLocalStaticRTP
+	// owner, ssrc and keyFrames route a subscriber's key frame request back to the
+	// publisher that can satisfy it. keyFrames is nil for audio, which never needs one.
+	owner     *peer
+	ssrc      webrtc.SSRC
+	keyFrames *keyFrameGate
+}
+
+// keyFrameGate collapses key frame requests for one uplink into at most one per
+// keyFrameMinInterval.
+type keyFrameGate struct {
+	mu   sync.Mutex
+	last time.Time
+}
+
+func (g *keyFrameGate) allow(now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.last.IsZero() && now.Sub(g.last) < keyFrameMinInterval {
+		return false
+	}
+	g.last = now
+	return true
+}
+
+// requestKeyFrame asks the publisher of this uplink for a key frame. Subscribers ask
+// for one when they cannot decode; the SFU does not decode and cannot tell on its own.
+func (t localTrack) requestKeyFrame(metrics *serverMetrics) {
+	if t.keyFrames == nil || t.owner == nil || t.owner.pc == nil {
+		return
+	}
+	if !t.keyFrames.allow(time.Now()) {
+		if metrics != nil {
+			metrics.keyFramesCollapsed.Add(1)
+		}
+		return
+	}
+	if metrics != nil {
+		metrics.keyFramesRequested.Add(1)
+	}
+	_ = t.owner.pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(t.ssrc)}})
 }
 
 type room struct {
@@ -141,9 +188,12 @@ type peer struct {
 	closed                  sync.Once
 	offered                 bool
 	pendingRemoteCandidates []webrtc.ICECandidateInit
-	rateMu                  sync.Mutex
-	rateWindowStarted       time.Time
-	rateWindowCount         int
+	// Video uplinks this peer subscribed to in the offer it has not answered yet.
+	// Guarded by signalMu, like the negotiation state it belongs to.
+	pendingKeyFrames  []localTrack
+	rateMu            sync.Mutex
+	rateWindowStarted time.Time
+	rateWindowCount   int
 }
 
 type controlCommand struct {
@@ -226,16 +276,12 @@ func (s *Server) SetReady(ready bool) {
 }
 
 func (s *Server) RunMaintenance(stop <-chan struct{}) {
-	keyFrameTicker := time.NewTicker(3 * time.Second)
 	pingTicker := time.NewTicker(websocketPingPeriod)
 	cleanupTicker := time.NewTicker(time.Minute)
-	defer keyFrameTicker.Stop()
 	defer pingTicker.Stop()
 	defer cleanupTicker.Stop()
 	for {
 		select {
-		case <-keyFrameTicker.C:
-			s.dispatchKeyFrames()
 		case <-pingTicker.C:
 			s.pingPeers()
 		case <-cleanupTicker.C:
@@ -300,6 +346,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	writeCounter(w, "tarnmedia_control_requests_total", s.metrics.controlRequests.Load())
 	writeCounter(w, "tarnmedia_control_auth_failures_total", s.metrics.controlAuthFailures.Load())
 	writeCounter(w, "tarnmedia_evicted_peers_total", s.metrics.evictedPeers.Load())
+	writeCounter(w, "tarnmedia_key_frames_requested_total", s.metrics.keyFramesRequested.Load())
+	writeCounter(w, "tarnmedia_key_frames_collapsed_total", s.metrics.keyFramesCollapsed.Load())
 }
 
 func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
@@ -730,18 +778,6 @@ func (s *Server) leave(roomID, peerID string) {
 	}
 }
 
-func (s *Server) dispatchKeyFrames() {
-	s.mu.RLock()
-	rooms := make([]*room, 0, len(s.rooms))
-	for _, current := range s.rooms {
-		rooms = append(rooms, current)
-	}
-	s.mu.RUnlock()
-	for _, current := range rooms {
-		current.dispatchKeyFrames()
-	}
-}
-
 func (r *room) forward(owner *peer, remote *webrtc.TrackRemote, source string) {
 	// The track id is carried in SDP to subscribers. Keeping owner and source in
 	// it lets the browser associate an arriving RTP track with the authenticated
@@ -753,7 +789,13 @@ func (r *room) forward(owner *peer, remote *webrtc.TrackRemote, source string) {
 		return
 	}
 
-	candidate := localTrack{ownerID: owner.id, source: source, track: local}
+	candidate := localTrack{
+		ownerID: owner.id, source: source, track: local,
+		owner: owner, ssrc: remote.SSRC(),
+	}
+	if remote.Kind() == webrtc.RTPCodecTypeVideo {
+		candidate.keyFrames = &keyFrameGate{}
+	}
 	r.mu.Lock()
 	// A browser may replace camera/screen capture with a new RTP source while
 	// keeping the negotiated transceiver. Only the newest uplink for a logical
@@ -848,7 +890,10 @@ func (r *room) syncPeerLocked(currentPeer *peer) error {
 		if err != nil {
 			return err
 		}
-		go drainRTCP(sender)
+		go readSubscriberRTCP(sender, candidate, r.metrics)
+		if candidate.keyFrames != nil {
+			currentPeer.pendingKeyFrames = append(currentPeer.pendingKeyFrames, candidate)
+		}
 		changed = true
 	}
 	if currentPeer.offered && !changed {
@@ -968,19 +1013,6 @@ func (r *room) applyPeerState(currentPeer *peer) {
 	}
 }
 
-func (r *room) dispatchKeyFrames() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, currentPeer := range r.peers {
-		for _, receiver := range currentPeer.pc.GetReceivers() {
-			track := receiver.Track()
-			if track != nil && track.Kind() == webrtc.RTPCodecTypeVideo {
-				_ = currentPeer.pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())}})
-			}
-		}
-	}
-}
-
 func (r *room) close() {
 	r.mu.Lock()
 	peers := make([]*peer, 0, len(r.peers))
@@ -1005,6 +1037,7 @@ func (p *peer) handleSignal(message signalMessage) error {
 		}
 		p.signalMu.Lock()
 		err := p.pc.SetRemoteDescription(answer)
+		var subscribed []localTrack
 		if err == nil {
 			for _, candidate := range p.pendingRemoteCandidates {
 				if candidateErr := p.pc.AddICECandidate(candidate); candidateErr != nil {
@@ -1014,11 +1047,23 @@ func (p *peer) handleSignal(message signalMessage) error {
 			}
 			p.pendingRemoteCandidates = nil
 		}
+		if err == nil {
+			// Hand the queue over only once the answer is fully applied. A failed
+			// negotiation leaves it in place for the next one.
+			subscribed, p.pendingKeyFrames = p.pendingKeyFrames, nil
+		}
 		p.signalMu.Unlock()
 		if err != nil {
 			return fmt.Errorf("apply WebRTC answer: %w", err)
 		}
 		p.room.sync()
+		// The answer is the first moment this subscriber can decode what it was just
+		// offered, and it subscribed between the publisher's own key frames. Only the
+		// newly subscribed uplinks are asked: renegotiation also happens on every mute
+		// toggle, and those must not cost the room a round of key frames.
+		for _, candidate := range subscribed {
+			candidate.requestKeyFrame(p.room.metrics)
+		}
 		return nil
 	case "candidate":
 		candidate := webrtc.ICECandidateInit{}
@@ -1146,13 +1191,39 @@ func (p *peer) allowSignal() bool {
 	return p.rateWindowCount <= maxSignalsPerWindow
 }
 
-func drainRTCP(sender *webrtc.RTPSender) {
+// readSubscriberRTCP consumes the RTCP a subscriber sends back about one forwarded
+// track. Everything the interceptors already handle (receiver reports, NACK) is
+// dropped here; a key frame request is the one thing only the publisher can answer,
+// so it is passed upstream. Reading must continue regardless: an unread stream
+// eventually stalls the sender.
+func readSubscriberRTCP(sender *webrtc.RTPSender, upstream localTrack, metrics *serverMetrics) {
 	buffer := make([]byte, 1500)
 	for {
-		if _, _, err := sender.Read(buffer); err != nil {
+		n, _, err := sender.Read(buffer)
+		if err != nil {
 			return
 		}
+		if upstream.keyFrames == nil {
+			continue
+		}
+		packets, err := rtcp.Unmarshal(buffer[:n])
+		if err != nil {
+			continue
+		}
+		if requestsKeyFrame(packets) {
+			upstream.requestKeyFrame(metrics)
+		}
 	}
+}
+
+func requestsKeyFrame(packets []rtcp.Packet) bool {
+	for _, packet := range packets {
+		switch packet.(type) {
+		case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+			return true
+		}
+	}
+	return false
 }
 
 func (p *peer) close() {

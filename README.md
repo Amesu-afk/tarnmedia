@@ -31,7 +31,7 @@ yourself. If you need a hardened, well-staffed SFU today, use LiveKit or mediaso
 - one Opus audio track plus camera and screen video inputs per participant;
 - forwarding of browser-negotiated standard codecs (Opus, VP8, H.264 and anything
   both endpoints support) without transcoding;
-- trickle ICE, renegotiation, periodic video keyframe requests, exact `Origin`
+- trickle ICE, renegotiation, on-demand video key frame requests, exact `Origin`
   allowlisting;
 - a bounded UDP port range and optional public-IP configuration;
 - a loopback-only authenticated control API for evicting users and closing rooms;

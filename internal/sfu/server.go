@@ -691,6 +691,13 @@ func (s *Server) join(claims auth.Claims, conn *websocket.Conn) (*peer, error) {
 		{kind: webrtc.RTPCodecTypeAudio, source: "microphone"},
 		{kind: webrtc.RTPCodecTypeVideo, source: "camera"},
 		{kind: webrtc.RTPCodecTypeVideo, source: "screen"},
+		// The screen's own sound travels on its own slot rather than mixed into
+		// the microphone: mute must silence the voice without silencing what is
+		// being shown, and the publisher's noise suppression must never touch it.
+		// This slot is deliberately LAST. The client answers the offer built from
+		// this list and picks its publish slots by m-line order, so appending
+		// keeps clients that predate the slot working against a newer server.
+		{kind: webrtc.RTPCodecTypeAudio, source: "screenAudio"},
 	} {
 		transceiver, err := pc.AddTransceiverFromKind(input.kind, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly})
 		if err != nil {
@@ -1144,7 +1151,7 @@ func (p *peer) sourceActive(source string) bool {
 	if source == "camera" {
 		return p.state.CameraOn
 	}
-	if source == "screen" {
+	if source == "screen" || source == "screenAudio" {
 		return p.state.ScreenOn
 	}
 	return false

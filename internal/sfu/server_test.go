@@ -352,3 +352,27 @@ func TestMicrophonePacketsRequireUnmutedTransmittingState(t *testing.T) {
 		t.Fatal("microphone packets must stop when PTT or VAD closes transmission")
 	}
 }
+
+func TestScreenAudioFollowsTheScreenAndIgnoresMute(t *testing.T) {
+	peer := &peer{}
+	if peer.sourceActive("screenAudio") {
+		t.Fatal("screen audio must not be forwarded while nothing is being shared")
+	}
+
+	peer.state.ScreenOn = true
+	if !peer.sourceActive("screenAudio") {
+		t.Fatal("screen audio must follow the screen it belongs to")
+	}
+
+	// Muting the microphone silences the voice, not the shared sound: they are
+	// separate slots precisely so that one can be cut without the other.
+	peer.state.MicMuted = true
+	if !peer.allowsPacketForwarding("screenAudio") {
+		t.Fatal("a muted microphone must not silence the shared screen's sound")
+	}
+
+	peer.state.ScreenOn = false
+	if peer.sourceActive("screenAudio") {
+		t.Fatal("stopping the share must stop its sound with it")
+	}
+}

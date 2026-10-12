@@ -267,6 +267,7 @@ func (s *Server) ControlHandler() http.Handler {
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /ready", s.handleReady)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
+	mux.HandleFunc("GET /v1/capabilities", s.handleCapabilities)
 	mux.HandleFunc("POST /v1/control", s.handleControl)
 	return mux
 }
@@ -348,6 +349,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	writeCounter(w, "tarnmedia_evicted_peers_total", s.metrics.evictedPeers.Load())
 	writeCounter(w, "tarnmedia_key_frames_requested_total", s.metrics.keyFramesRequested.Load())
 	writeCounter(w, "tarnmedia_key_frames_collapsed_total", s.metrics.keyFramesCollapsed.Load())
+}
+
+func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
+	if !s.controlAuthorized(r.Header.Get("Authorization")) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"maxPeersPerRoom": s.cfg.MaxPeersPerRoom})
 }
 
 func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {

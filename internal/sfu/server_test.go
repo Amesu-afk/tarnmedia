@@ -45,6 +45,30 @@ func TestControlEndpointRequiresBearerSecret(t *testing.T) {
 	}
 }
 
+func TestCapabilitiesRequireSecretAndReturnActualRoomLimit(t *testing.T) {
+	server := testServer(t)
+	for _, authorized := range []bool{false, true} {
+		request := httptest.NewRequest(http.MethodGet, "/v1/capabilities", nil)
+		if authorized {
+			request.Header.Set("Authorization", "Bearer control-secret-that-is-long-enough-for-tests")
+		}
+		response := httptest.NewRecorder()
+		server.ControlHandler().ServeHTTP(response, request)
+		if !authorized {
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401, got %d", response.Code)
+			}
+			continue
+		}
+		var result struct {
+			MaxPeersPerRoom int `json:"maxPeersPerRoom"`
+		}
+		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil || result.MaxPeersPerRoom != 10 {
+			t.Fatalf("incorrect capabilities: %d %s", response.Code, response.Body.String())
+		}
+	}
+}
+
 func TestCloseRoomRevokesAlreadyIssuedTokens(t *testing.T) {
 	server := testServer(t)
 	issuedAt := time.Now().Add(-time.Second)

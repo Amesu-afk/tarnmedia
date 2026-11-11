@@ -94,11 +94,12 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("TARNMEDIA_MAX_PEERS_PER_ROOM must be between 2 and 100")
 	}
 
-	min, err := envUint16("TARNMEDIA_UDP_MIN", 50000)
+	// Keep default ICE/STUN traffic outside common Discord interception profiles.
+	min, err := envUint16("TARNMEDIA_UDP_MIN", 42000)
 	if err != nil {
 		return Config{}, err
 	}
-	max, err := envUint16("TARNMEDIA_UDP_MAX", 50100)
+	max, err := envUint16("TARNMEDIA_UDP_MAX", 42100)
 	if err != nil {
 		return Config{}, err
 	}

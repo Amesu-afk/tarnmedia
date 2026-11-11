@@ -2,13 +2,11 @@
 
 **English** · [Русский](README.ru.md)
 
-A small, readable WebRTC SFU written in Go on top of [Pion](https://github.com/pion/webrtc).
-It forwards audio, camera and screen-share tracks between participants of a room,
-authorizes them with JWTs issued by *your* application, and does nothing else.
+WebRTC SFU for voice rooms, video calls and screen sharing, written in Go on top of [Pion](https://github.com/pion/webrtc).
 
-TarnMedia is the media backend of [TarnVeil](https://tarnveil.ru), a small chat and
-voice application, and is extracted from it. It is roughly 1,500 lines of Go, so
-reading the whole thing is a realistic way to understand how an SFU works.
+TarnMedia forwards media between room participants without transcoding. Your application controls access through short-lived JWTs; the server handles signaling, track forwarding and room connections.
+
+It powers calls and voice rooms in [TarnVeil](https://tarnveil.ru) and is available as a standalone server for integration with other applications.
 
 ## Status
 
@@ -22,8 +20,7 @@ reading the whole thing is a realistic way to understand how an SFU works.
 - there is one maintainer and no support commitment. See [SECURITY.md](SECURITY.md)
   for what that means for vulnerability reports.
 
-Use it to learn, to prototype, or as a starting point you are willing to maintain
-yourself. If you need a hardened, well-staffed SFU today, use LiveKit or mediasoup.
+Self-hosted deployments require independent testing of room sizes, network conditions and failure recovery. If your requirements include mature scaling features or a larger support ecosystem, evaluate LiveKit or mediasoup.
 
 ## What it does
 
@@ -58,7 +55,7 @@ go run ./cmd/tarnmedia
 ```
 
 The public HTTP/WebSocket handler listens on `:8088`, media uses UDP
-`50000-50100`, and the control API plus `/metrics` listen on `127.0.0.1:8089`.
+`42000-42100`, and the control API plus `/metrics` listen on `127.0.0.1:8089`.
 By default only `http://localhost:5173` and `http://127.0.0.1:5173` are accepted
 as browser origins — every real deployment must set its own.
 
@@ -94,7 +91,7 @@ supported path.
 | `TARNMEDIA_AUTH_URL` | `http://127.0.0.1:3001/internal/tarnmedia/validate` | Your session-validation endpoint (see below). Must be HTTPS or loopback HTTP. |
 | `TARNMEDIA_ALLOWED_ORIGINS` | local dev origins | Exact scheme+host allowlist, comma-separated. |
 | `TARNMEDIA_PUBLIC_IP` | *(empty)* | Address to advertise in ICE candidates when behind NAT. |
-| `TARNMEDIA_UDP_MIN` / `TARNMEDIA_UDP_MAX` | `50000` / `50100` | Media UDP port range. |
+| `TARNMEDIA_UDP_MIN` / `TARNMEDIA_UDP_MAX` | `42000` / `42100` | Media UDP port range. |
 | `TARNMEDIA_ICE_URLS` | *(empty)* | Your own STUN/TURN endpoints, comma-separated. No third-party server is used by default. |
 | `TARNMEDIA_ICE_USERNAME` / `TARNMEDIA_ICE_CREDENTIAL` | *(empty)* | Credentials for the above. |
 | `TARNMEDIA_MAX_PEERS_PER_ROOM` | `25` | Hard cap per room, 2–100. |

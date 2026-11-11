@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -36,6 +37,17 @@ const (
 	// ask for one at the same moment, so requests are collapsed per uplink: one key
 	// frame answers all of them.
 	keyFrameMinInterval = 500 * time.Millisecond
+	// A stalled ICE path is usually a NAT rebinding or a network switch, not a
+	// participant who left. Spend an ICE restart or two before dropping the call:
+	// the browser answers the restarted offer and both sides gather fresh
+	// candidates under the same signaling socket.
+	iceRestartDelay    = 4 * time.Second
+	iceRestartAttempts = 2
+	// A publisher that stops sending RTP while the room is willing to forward its
+	// audio is the first thing to know about a one-way-audio call. Checked often
+	// enough to be useful in incident logs, rare enough to stay cheap.
+	mediaStallCheckPeriod = 15 * time.Second
+	mediaStallTimeout     = 10 * time.Second
 )
 
 type serverMetrics struct {
@@ -46,6 +58,7 @@ type serverMetrics struct {
 	signalRateLimited    atomic.Uint64
 	forwardedPackets     atomic.Uint64
 	forwardedBytes       atomic.Uint64
+	forwardWriteFailures atomic.Uint64
 	controlRequests      atomic.Uint64
 	controlAuthFailures  atomic.Uint64
 	evictedPeers         atomic.Uint64
@@ -126,6 +139,17 @@ type localTrack struct {
 	owner     *peer
 	ssrc      webrtc.SSRC
 	keyFrames *keyFrameGate
+	// Shared with the forwarding loop (the struct itself is copied into the room
+	// maps), so the stall watchdog sees live packet timing.
+	activity *trackActivity
+}
+
+// trackActivity carries the timing the stall watchdog needs. Every field is
+// atomic because the forwarding goroutine and the maintenance ticker both touch
+// it through copies of localTrack.
+type trackActivity struct {
+	lastPacket atomic.Int64 // unix nanoseconds of the last RTP packet read
+	stalled    atomic.Bool
 }
 
 // keyFrameGate collapses key frame requests for one uplink into at most one per
@@ -171,6 +195,9 @@ type room struct {
 	uplinks  map[string]localTrack
 	tracks   map[string]localTrack
 	metrics  *serverMetrics
+	// Packets that reached none of the subscribers. Kept per room so a broken
+	// subscriber can be reported once instead of flooding the log.
+	forwardFailures atomic.Uint64
 }
 
 type peer struct {
@@ -188,6 +215,11 @@ type peer struct {
 	closed                  sync.Once
 	offered                 bool
 	pendingRemoteCandidates []webrtc.ICECandidateInit
+	// ICE recovery state. Touched from the connection-state callback, the
+	// signaling loop and the recovery timer, so everything is under recoveryMu.
+	recoveryMu    sync.Mutex
+	recoveryTimer *time.Timer
+	iceRestarts   int
 	// Video uplinks this peer subscribed to in the offer it has not answered yet.
 	// Guarded by signalMu, like the negotiation state it belongs to.
 	pendingKeyFrames  []localTrack
@@ -278,13 +310,17 @@ func (s *Server) SetReady(ready bool) {
 
 func (s *Server) RunMaintenance(stop <-chan struct{}) {
 	pingTicker := time.NewTicker(websocketPingPeriod)
+	stallTicker := time.NewTicker(mediaStallCheckPeriod)
 	cleanupTicker := time.NewTicker(time.Minute)
 	defer pingTicker.Stop()
+	defer stallTicker.Stop()
 	defer cleanupTicker.Stop()
 	for {
 		select {
 		case <-pingTicker.C:
 			s.pingPeers()
+		case <-stallTicker.C:
+			s.checkMediaStalls(time.Now())
 		case <-cleanupTicker.C:
 			s.cleanupRevocations()
 		case <-stop:
@@ -344,6 +380,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	writeCounter(w, "tarnmedia_signal_rate_limited_total", s.metrics.signalRateLimited.Load())
 	writeCounter(w, "tarnmedia_forwarded_packets_total", s.metrics.forwardedPackets.Load())
 	writeCounter(w, "tarnmedia_forwarded_bytes_total", s.metrics.forwardedBytes.Load())
+	writeCounter(w, "tarnmedia_forward_write_failures_total", s.metrics.forwardWriteFailures.Load())
 	writeCounter(w, "tarnmedia_control_requests_total", s.metrics.controlRequests.Load())
 	writeCounter(w, "tarnmedia_control_auth_failures_total", s.metrics.controlAuthFailures.Load())
 	writeCounter(w, "tarnmedia_evicted_peers_total", s.metrics.evictedPeers.Load())
@@ -408,6 +445,7 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported action"})
 		return
 	}
+	slog.Info("media control applied", "action", command.Action, "room", command.Room, "user", command.UserID, "affectedPeers", affected)
 	s.metrics.evictedPeers.Add(uint64(affected))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affectedPeers": affected})
 }
@@ -548,6 +586,7 @@ func (s *Server) pingPeers() {
 		current.mu.Unlock()
 		for _, currentPeer := range peers {
 			if err := currentPeer.ping(); err != nil {
+				slog.Warn("signaling ping failed", "room", current.id, "peer", currentPeer.id, "reason", signalingCloseReason(err), "state", currentPeer.pc.ConnectionState().String())
 				_ = currentPeer.ws.Close()
 			}
 		}
@@ -556,6 +595,58 @@ func (s *Server) pingPeers() {
 
 func revocationKey(roomID, userID string) string {
 	return roomID + "\x00" + userID
+}
+
+// checkMediaStalls reports publishers whose RTP stopped arriving while the room
+// is still willing to forward their audio. This is the difference between "the
+// call is fine but nobody speaks" and "this participant went silent", which is
+// otherwise indistinguishable in the logs.
+func (s *Server) checkMediaStalls(now time.Time) {
+	s.mu.RLock()
+	rooms := make([]*room, 0, len(s.rooms))
+	for _, current := range s.rooms {
+		rooms = append(rooms, current)
+	}
+	s.mu.RUnlock()
+	for _, current := range rooms {
+		current.checkMediaStalls(now)
+	}
+}
+
+func (r *room) checkMediaStalls(now time.Time) {
+	r.mu.Lock()
+	uplinks := make([]localTrack, 0, len(r.uplinks))
+	for _, candidate := range r.uplinks {
+		uplinks = append(uplinks, candidate)
+	}
+	r.mu.Unlock()
+
+	for _, candidate := range uplinks {
+		if candidate.activity == nil || candidate.owner == nil {
+			continue
+		}
+		// A muted or PTT/VAD-gated publisher legitimately sends nothing, and the
+		// room is not forwarding it anyway: that silence is not a stall.
+		if !candidate.owner.allowsPacketForwarding(candidate.source) {
+			candidate.activity.stalled.Store(false)
+			continue
+		}
+		last := candidate.activity.lastPacket.Load()
+		if last == 0 {
+			continue
+		}
+		silent := now.Sub(time.Unix(0, last))
+		if silent <= mediaStallTimeout {
+			if candidate.activity.stalled.Swap(false) {
+				slog.Info("publisher media resumed", "room", r.id, "publisher", candidate.ownerID, "source", candidate.source)
+			}
+			continue
+		}
+		// One line per episode, not one per tick.
+		if !candidate.activity.stalled.Swap(true) {
+			slog.Warn("publisher media stalled", "room", r.id, "publisher", candidate.ownerID, "source", candidate.source, "silentFor", silent.Round(time.Second).String())
+		}
+	}
 }
 
 func validControlIdentifier(value string, max int) bool {
@@ -613,6 +704,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	for {
 		message := signalMessage{}
 		if err := conn.ReadJSON(&message); err != nil {
+			slog.Info("signaling closed", "room", claims.Room, "peer", currentPeer.id, "reason", signalingCloseReason(err), "state", currentPeer.pc.ConnectionState().String())
 			return
 		}
 		if !currentPeer.allowSignal() {
@@ -628,6 +720,24 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Record bounded transport categories, never client-supplied close text or SDP.
+func signalingCloseReason(err error) string {
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return fmt.Sprintf("websocket-%d", closeErr.Code)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return "socket-closed"
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "eof"
+	}
+	return "transport-or-protocol-error"
+}
 func (s *Server) authenticate(conn *websocket.Conn) (auth.Claims, error) {
 	message := signalMessage{}
 	if err := conn.ReadJSON(&message); err != nil {
@@ -650,32 +760,57 @@ func (s *Server) authenticate(conn *websocket.Conn) (auth.Claims, error) {
 	return claims, nil
 }
 
+var (
+	// The API could not answer (down, busy, 5xx). Worth one more try: a brief
+	// hiccup must not turn into a failed join.
+	errValidationUnavailable = errors.New("media session validation is unavailable")
+	// The API answered and refused (ban, password change, revoked session).
+	// Fail closed immediately; retrying only delays an inevitable rejection.
+	errSessionInactive = errors.New("media session is no longer active")
+)
+
 // validateSession keeps the SFU stateless with respect to user accounts while
 // still making a JWT revocable after a password change or ban. The endpoint
 // is loopback-only in normal deployment and requires the control secret.
 func (s *Server) validateSession(claims auth.Claims) error {
-	body, err := json.Marshal(struct {
+	payload, err := json.Marshal(struct {
 		UserID         string `json:"userId"`
 		SessionVersion int    `json:"sessionVersion"`
 	}{UserID: claims.UserID, SessionVersion: claims.SessionVersion})
 	if err != nil {
-		return errors.New("media session validation failed")
+		return errValidationUnavailable
 	}
-	req, err := http.NewRequest(http.MethodPost, s.cfg.AuthURL, bytes.NewReader(body))
+	// Two attempts total. The call is a read-only check, so repeating it is safe.
+	for attempt := 0; attempt < 2; attempt++ {
+		err := s.requestSessionValidation(payload)
+		if err == nil || !errors.Is(err, errValidationUnavailable) {
+			return err
+		}
+	}
+	return errValidationUnavailable
+}
+
+func (s *Server) requestSessionValidation(payload []byte) error {
+	req, err := http.NewRequest(http.MethodPost, s.cfg.AuthURL, bytes.NewReader(payload))
 	if err != nil {
-		return errors.New("media session validation is unavailable")
+		return errValidationUnavailable
 	}
 	req.Header.Set("Authorization", "Bearer "+s.cfg.ControlSecret)
 	req.Header.Set("Content-Type", "application/json")
 	response, err := s.authHTTP.Do(req)
 	if err != nil {
-		return errors.New("media session validation is unavailable")
+		return errValidationUnavailable
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusNoContent {
-		return errors.New("media session is no longer active")
+	// Drain before closing so the connection can be reused for the retry.
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode == http.StatusNoContent {
+		return nil
 	}
-	return nil
+	if response.StatusCode >= http.StatusInternalServerError {
+		return errValidationUnavailable
+	}
+	return errSessionInactive
 }
 
 func (s *Server) join(claims auth.Claims, conn *websocket.Conn) (*peer, error) {
@@ -756,7 +891,15 @@ func (s *Server) join(claims auth.Claims, conn *websocket.Conn) (*peer, error) {
 	})
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		slog.Info("peer state changed", "room", claims.Room, "peer", claims.ParticipantID, "state", state.String())
-		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
+		switch state {
+		case webrtc.PeerConnectionStateConnected:
+			currentPeer.settleICERecovery()
+		case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed:
+			// Wait out a brief stall before spending a renegotiation: a short
+			// hiccup recovers on its own, and only a path that stays broken is
+			// worth new ICE credentials.
+			currentPeer.scheduleICERecovery()
+		case webrtc.PeerConnectionStateClosed:
 			// Closing the signaling socket makes the handler leave the room and
 			// perform the single, ordered PeerConnection cleanup.
 			_ = currentPeer.ws.Close()
@@ -805,9 +948,10 @@ func (r *room) forward(owner *peer, remote *webrtc.TrackRemote, source string) {
 		return
 	}
 
+	activity := &trackActivity{}
 	candidate := localTrack{
 		ownerID: owner.id, source: source, track: local,
-		owner: owner, ssrc: remote.SSRC(),
+		owner: owner, ssrc: remote.SSRC(), activity: activity,
 	}
 	if remote.Kind() == webrtc.RTPCodecTypeVideo {
 		candidate.keyFrames = &keyFrameGate{}
@@ -842,6 +986,9 @@ func (r *room) forward(owner *peer, remote *webrtc.TrackRemote, source string) {
 		if err != nil {
 			return
 		}
+		// Recorded before the mute gate: the watchdog measures the publisher's
+		// stream, not whether this room decided to forward it.
+		activity.lastPacket.Store(time.Now().UnixNano())
 		// MediaStreamTrack.enabled is the first mute barrier, but some WebView /
 		// device combinations can keep producing RTP while that state propagates.
 		// Do not let manual mute or the effective PTT/VAD policy feed speaker audio
@@ -857,22 +1004,58 @@ func (r *room) forward(owner *peer, remote *webrtc.TrackRemote, source string) {
 			r.metrics.forwardedBytes.Add(uint64(packet.MarshalSize()))
 		}
 		if err := local.WriteRTP(packet); err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			return
+			// The error belongs to one subscriber (a closing transport, a sender
+			// that has not bound yet), never to the room. Returning here used to
+			// mute the publisher for everybody and force a room-wide
+			// renegotiation; draining the publisher is also required, otherwise
+			// its own RTP stream stalls.
+			r.noteForwardFailure(owner.id, source, err)
 		}
 	}
 }
 
+// noteForwardFailure records a packet that failed for at least one subscriber.
+// Pion aggregates per-binding errors, so with several subscribers the failing one
+// is not identified here; the counter is both a metric and the log throttle,
+// because a permanently broken subscriber would otherwise produce hundreds of
+// identical lines per second.
+func (r *room) noteForwardFailure(ownerID, source string, err error) {
+	failures := r.forwardFailures.Add(1)
+	if r.metrics != nil {
+		r.metrics.forwardWriteFailures.Add(1)
+	}
+	if failures == 1 || failures%500 == 0 {
+		slog.Warn("RTP write failed", "room", r.id, "publisher", ownerID, "source", source, "failures", failures, "error", err)
+	}
+}
+
 func (r *room) sync() {
+	// The room lock is held only while the lists are copied. Writing to a
+	// signaling socket can wait for a stuck client for up to five seconds, and
+	// doing that under r.mu froze the whole room: new uplinks, departures and
+	// camera toggles all waited for the slowest subscriber.
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	peers := make([]*peer, 0, len(r.peers))
 	for _, currentPeer := range r.peers {
-		if err := r.syncPeerLocked(currentPeer); err != nil {
+		peers = append(peers, currentPeer)
+	}
+	tracks := make(map[string]localTrack, len(r.tracks))
+	for id, candidate := range r.tracks {
+		tracks[id] = candidate
+	}
+	r.mu.Unlock()
+
+	for _, currentPeer := range peers {
+		if err := r.syncPeer(currentPeer, tracks); err != nil {
 			slog.Warn("renegotiation failed", "room", r.id, "peer", currentPeer.id, "error", err)
 		}
 	}
 }
 
-func (r *room) syncPeerLocked(currentPeer *peer) error {
+// syncPeer brings one subscriber's senders in line with the given track
+// snapshot. Callers must not hold the room lock (see sync); the per-peer
+// signaling lock serializes concurrent negotiations instead.
+func (r *room) syncPeer(currentPeer *peer, available map[string]localTrack) error {
 	currentPeer.signalMu.Lock()
 	defer currentPeer.signalMu.Unlock()
 	if currentPeer.pc.ConnectionState() == webrtc.PeerConnectionStateClosed {
@@ -890,7 +1073,7 @@ func (r *room) syncPeerLocked(currentPeer *peer) error {
 			continue
 		}
 		existing[track.ID()] = true
-		candidate, present := r.tracks[track.ID()]
+		candidate, present := available[track.ID()]
 		if !present || candidate.ownerID == currentPeer.id {
 			if err := currentPeer.pc.RemoveTrack(sender); err != nil {
 				return err
@@ -898,7 +1081,7 @@ func (r *room) syncPeerLocked(currentPeer *peer) error {
 			changed = true
 		}
 	}
-	for id, candidate := range r.tracks {
+	for id, candidate := range available {
 		if candidate.ownerID == currentPeer.id || existing[id] {
 			continue
 		}
@@ -930,7 +1113,7 @@ func (r *room) syncPeerLocked(currentPeer *peer) error {
 		if sender == nil || sender.Track() == nil {
 			continue
 		}
-		candidate, present := r.tracks[sender.Track().ID()]
+		candidate, present := available[sender.Track().ID()]
 		if !present || candidate.ownerID == currentPeer.id {
 			continue
 		}
@@ -1104,8 +1287,15 @@ func (p *peer) handleSignal(message signalMessage) error {
 			return errors.New("invalid participant media state")
 		}
 		p.stateMu.Lock()
+		previous := p.state
 		p.state = state
 		p.stateMu.Unlock()
+		// Clients repeat their state after every reconnect and on every control
+		// touch. A full participant snapshot for everyone when nothing changed is
+		// pure noise, and the signaling budget is finite.
+		if previous == state {
+			return nil
+		}
 		p.room.applyPeerState(p)
 		p.room.broadcastParticipants()
 		return nil
@@ -1195,6 +1385,95 @@ func (p *peer) ping() error {
 	return p.ws.WriteControl(websocket.PingMessage, nil, deadline)
 }
 
+// scheduleICERecovery waits out a short stall before spending an ICE restart.
+// Only one timer is armed at a time: the state callback fires on every broken
+// sample while the path stays down.
+func (p *peer) scheduleICERecovery() {
+	p.recoveryMu.Lock()
+	defer p.recoveryMu.Unlock()
+	if p.recoveryTimer != nil {
+		return
+	}
+	// The state callback can still fire while the room tears this peer down.
+	if p.pc == nil || p.pc.ConnectionState() == webrtc.PeerConnectionStateClosed {
+		return
+	}
+	p.recoveryTimer = time.AfterFunc(iceRestartDelay, p.recoverICE)
+}
+
+func (p *peer) cancelICERecovery() {
+	p.recoveryMu.Lock()
+	if p.recoveryTimer != nil {
+		p.recoveryTimer.Stop()
+		p.recoveryTimer = nil
+	}
+	p.recoveryMu.Unlock()
+}
+
+// settleICERecovery runs once the transport is healthy again: the spent budget
+// is returned so a later blip still gets its full allowance.
+func (p *peer) settleICERecovery() {
+	p.cancelICERecovery()
+	p.recoveryMu.Lock()
+	p.iceRestarts = 0
+	p.recoveryMu.Unlock()
+}
+
+func (p *peer) recoverICE() {
+	p.recoveryMu.Lock()
+	p.recoveryTimer = nil
+	attempts := p.iceRestarts
+	p.iceRestarts++
+	p.recoveryMu.Unlock()
+
+	if p.pc == nil || p.ws == nil {
+		return
+	}
+	state := p.pc.ConnectionState()
+	if state == webrtc.PeerConnectionStateConnected || state == webrtc.PeerConnectionStateClosed {
+		return
+	}
+	if attempts >= iceRestartAttempts {
+		slog.Warn("ICE recovery exhausted", "peer", p.id, "state", state.String())
+		// Closing the signaling socket leaves the room through the single,
+		// ordered cleanup in the WebSocket handler, like any other goodbye.
+		_ = p.ws.Close()
+		return
+	}
+	if err := p.restartICE(); err != nil {
+		slog.Warn("ICE restart failed", "peer", p.id, "error", err)
+	}
+	p.scheduleICERecovery()
+}
+
+// restartICE renegotiates the transport with fresh ICE credentials. This is the
+// only way to revive a stalled pair without losing the participant: the browser
+// is the answerer here, so it can only restart ICE after an offer from this
+// side, and applying such an offer moves it out of failed back to connecting.
+func (p *peer) restartICE() error {
+	// The offer must be written while signalMu is held: the candidate callback
+	// serializes gathering behind it, and candidates for the new generation are
+	// useless (and rejected) before the offer that introduces them.
+	p.signalMu.Lock()
+	defer p.signalMu.Unlock()
+	if p.pc.ConnectionState() == webrtc.PeerConnectionStateClosed {
+		return nil
+	}
+	if p.pc.SignalingState() != webrtc.SignalingStateStable {
+		// A renegotiation is already in flight. It carries its own candidates,
+		// so there is nothing to add here and no reason to fail the recovery.
+		return nil
+	}
+	offer, err := p.pc.CreateOffer(&webrtc.OfferOptions{ICERestart: true})
+	if err != nil {
+		return err
+	}
+	if err := p.pc.SetLocalDescription(offer); err != nil {
+		return err
+	}
+	return p.write("offer", offer)
+}
+
 func (p *peer) allowSignal() bool {
 	now := time.Now()
 	p.rateMu.Lock()
@@ -1244,6 +1523,8 @@ func requestsKeyFrame(packets []rtcp.Packet) bool {
 
 func (p *peer) close() {
 	p.closed.Do(func() {
+		// A pending recovery attempt must not touch a closed transport.
+		p.cancelICERecovery()
 		_ = p.pc.Close()
 		_ = p.ws.Close()
 	})

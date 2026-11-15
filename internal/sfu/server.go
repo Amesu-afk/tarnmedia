@@ -38,11 +38,20 @@ const (
 	// frame answers all of them.
 	keyFrameMinInterval = 500 * time.Millisecond
 	// A stalled ICE path is usually a NAT rebinding or a network switch, not a
-	// participant who left. Spend an ICE restart or two before dropping the call:
-	// the browser answers the restarted offer and both sides gather fresh
+	// participant who left. Spend an ICE restart before dropping the call: the
+	// browser answers the restarted offer and both sides gather fresh
 	// candidates under the same signaling socket.
-	iceRestartDelay    = 4 * time.Second
-	iceRestartAttempts = 2
+	//
+	// The delay is the silence a broken path costs before the FIRST attempt, so
+	// the shorter it is, the sooner the call comes back. The budget counts REAL
+	// attempts only: an attempt burnt while a renegotiation is in flight does
+	// not count, see recoverICE.
+	iceRestartDelay    = 3 * time.Second
+	iceRestartAttempts = 3
+	// How many times recovery may be postponed because a renegotiation is in
+	// flight. Such a renegotiation carries its own candidates, so waiting for it
+	// is better than spending the restart budget on a no-op.
+	iceRecoveryDefers = 3
 	// A publisher that stops sending RTP while the room is willing to forward its
 	// audio is the first thing to know about a one-way-audio call. Checked often
 	// enough to be useful in incident logs, rare enough to stay cheap.
@@ -220,6 +229,9 @@ type peer struct {
 	recoveryMu    sync.Mutex
 	recoveryTimer *time.Timer
 	iceRestarts   int
+	// How many times recovery was postponed because a renegotiation was in
+	// flight. Postponements do not spend the restart budget.
+	iceDefers int
 	// Video uplinks this peer subscribed to in the offer it has not answered yet.
 	// Guarded by signalMu, like the negotiation state it belongs to.
 	pendingKeyFrames  []localTrack
@@ -1416,6 +1428,7 @@ func (p *peer) settleICERecovery() {
 	p.cancelICERecovery()
 	p.recoveryMu.Lock()
 	p.iceRestarts = 0
+	p.iceDefers = 0
 	p.recoveryMu.Unlock()
 }
 
@@ -1423,7 +1436,7 @@ func (p *peer) recoverICE() {
 	p.recoveryMu.Lock()
 	p.recoveryTimer = nil
 	attempts := p.iceRestarts
-	p.iceRestarts++
+	defers := p.iceDefers
 	p.recoveryMu.Unlock()
 
 	if p.pc == nil || p.ws == nil {
@@ -1431,8 +1444,29 @@ func (p *peer) recoverICE() {
 	}
 	state := p.pc.ConnectionState()
 	if state == webrtc.PeerConnectionStateConnected || state == webrtc.PeerConnectionStateClosed {
+		// The path recovered on its own. The budget stays untouched: settleICERecovery
+		// resets it when the state change arrives, and an attempt spent on a path
+		// that is already healthy is an attempt spent for nothing.
 		return
 	}
+
+	// A renegotiation is already in flight. It carries its own candidates, so an
+	// ICE restart cannot be applied right now — and it must NOT cost a restart
+	// from the budget: the old code counted such no-ops, so two collisions with
+	// an unrelated renegotiation closed the peer without a single real attempt.
+	if p.pc.SignalingState() != webrtc.SignalingStateStable {
+		if defers >= iceRecoveryDefers {
+			slog.Warn("ICE recovery postponed too often", "peer", p.id, "state", state.String())
+			_ = p.ws.Close()
+			return
+		}
+		p.recoveryMu.Lock()
+		p.iceDefers++
+		p.recoveryMu.Unlock()
+		p.scheduleICERecovery()
+		return
+	}
+
 	if attempts >= iceRestartAttempts {
 		slog.Warn("ICE recovery exhausted", "peer", p.id, "state", state.String())
 		// Closing the signaling socket leaves the room through the single,
@@ -1440,6 +1474,12 @@ func (p *peer) recoverICE() {
 		_ = p.ws.Close()
 		return
 	}
+
+	p.recoveryMu.Lock()
+	p.iceDefers = 0
+	p.iceRestarts++
+	p.recoveryMu.Unlock()
+
 	if err := p.restartICE(); err != nil {
 		slog.Warn("ICE restart failed", "peer", p.id, "error", err)
 	}

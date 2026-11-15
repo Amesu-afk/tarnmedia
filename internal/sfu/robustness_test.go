@@ -73,9 +73,9 @@ func TestDuplicateMediaStateDoesNotRebroadcastParticipants(t *testing.T) {
 	defer cancel()
 	_, wsURL, jwtSecret := newRobustnessServer(t)
 
-	a := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-a", false)
+	a := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-a", "robustness-room", false)
 	defer a.close()
-	b := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-b", false)
+	b := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-b", "robustness-room", false)
 	defer b.close()
 	waitLifecycleConnected(t, ctx, a)
 	waitLifecycleConnected(t, ctx, b)

@@ -78,9 +78,9 @@ func TestAbruptPeerLeaveAndReconnectKeepsRemainingRTP(t *testing.T) {
 
 	// B publishes continuously; C subscribes to B and A. A is then abruptly
 	// removed and reconnects under the same participant ID.
-	b := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-b", true)
+	b := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-b", "lifecycle-room", true)
 	defer b.close()
-	c := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-c", true)
+	c := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-c", "lifecycle-room", true)
 	defer c.close()
 
 	waitLifecycleConnected(t, ctx, b)
@@ -88,7 +88,7 @@ func TestAbruptPeerLeaveAndReconnectKeepsRemainingRTP(t *testing.T) {
 	waitParticipantCount(t, ctx, c, 2)
 	waitPacketCount(t, ctx, c, "peer-b", 5)
 
-	a := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-a", true)
+	a := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-a", "lifecycle-room", true)
 	defer a.close()
 	waitLifecycleConnected(t, ctx, a)
 	waitParticipantCount(t, ctx, c, 3)
@@ -108,7 +108,7 @@ func TestAbruptPeerLeaveAndReconnectKeepsRemainingRTP(t *testing.T) {
 	// Rejoining with the same participant ID must work after leave cleanup, and
 	// both the old subscriber (C) and the publisher (B) must remain usable.
 	answersBeforeRejoin := c.answeredOffers.Load()
-	a2 := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-a", true)
+	a2 := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-a", "lifecycle-room", true)
 	defer a2.close()
 	waitLifecycleConnected(t, ctx, a2)
 	waitParticipantCount(t, ctx, c, 3)
@@ -157,9 +157,9 @@ func TestICERestartKeepsTheCallAndRefreshesCredentials(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/v1/ws"
 
 	// B publishes and subscribes; A publishes so B has a live downlink to lose.
-	b := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-b", true)
+	b := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-b", "lifecycle-room", true)
 	defer b.close()
-	a := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-a", true)
+	a := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "peer-a", "lifecycle-room", true)
 	defer a.close()
 
 	waitLifecycleConnected(t, ctx, b)
@@ -222,7 +222,7 @@ func sdpAttribute(sdp, name string) string {
 	return ""
 }
 
-func newLifecyclePeer(t *testing.T, ctx context.Context, wsURL, jwtSecret, id string, publish bool) *lifecyclePeer {
+func newLifecyclePeer(t *testing.T, ctx context.Context, wsURL, jwtSecret, id, room string, publish bool) *lifecyclePeer {
 	t.Helper()
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
@@ -285,7 +285,7 @@ func newLifecyclePeer(t *testing.T, ctx context.Context, wsURL, jwtSecret, id st
 	})
 
 	claims := auth.Claims{
-		Room: "lifecycle-room", ParticipantID: id, UserID: "user-" + id,
+		Room: room, ParticipantID: id, UserID: "user-" + id,
 		SessionVersion: 1, Username: id, DisplayName: id,
 		IssuedAtMS: time.Now().UnixMilli(),
 		RegisteredClaims: jwt.RegisteredClaims{

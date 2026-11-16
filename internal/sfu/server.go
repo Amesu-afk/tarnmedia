@@ -223,6 +223,9 @@ type peer struct {
 	state                   mediaState
 	closed                  sync.Once
 	offered                 bool
+	// A track snapshot arrived while SDP was busy. Guarded by signalMu, like
+	// the negotiation state it belongs to; the answer handler repeats the sync.
+	syncDirty               bool
 	pendingRemoteCandidates []webrtc.ICECandidateInit
 	// ICE recovery state. Touched from the connection-state callback, the
 	// signaling loop and the recovery timer, so everything is under recoveryMu.
@@ -1074,6 +1077,11 @@ func (r *room) syncPeer(currentPeer *peer, available map[string]localTrack) erro
 		return nil
 	}
 	if currentPeer.pc.SignalingState() != webrtc.SignalingStateStable {
+		// The snapshot is still valid, but SDP cannot change while a
+		// negotiation is in flight. Remember it: without this flag the track
+		// change was silently lost until some unrelated room event happened to
+		// trigger another sync — heard as a one-off silence at call start.
+		currentPeer.syncDirty = true
 		return nil
 	}
 
@@ -1137,7 +1145,11 @@ func (r *room) syncPeer(currentPeer *peer, available map[string]localTrack) erro
 	if err := currentPeer.write("tracks", map[string]any{"tracks": tracks}); err != nil {
 		return err
 	}
-	return currentPeer.write("offer", offer)
+	if err := currentPeer.write("offer", offer); err != nil {
+		return err
+	}
+	currentPeer.syncDirty = false
+	return nil
 }
 
 func (r *room) removePeer(peerID string) bool {
@@ -1268,6 +1280,15 @@ func (p *peer) handleSignal(message signalMessage) error {
 			return fmt.Errorf("apply WebRTC answer: %w", err)
 		}
 		p.room.sync()
+		// A sync that landed while the SDP was busy was remembered but had no
+		// fresh snapshot at that moment. Repeat it now that signaling is stable.
+		p.signalMu.Lock()
+		dirty := p.syncDirty
+		p.syncDirty = false
+		p.signalMu.Unlock()
+		if dirty {
+			p.room.sync()
+		}
 		// The answer is the first moment this subscriber can decode what it was just
 		// offered, and it subscribed between the publisher's own key frames. Only the
 		// newly subscribed uplinks are asked: renegotiation also happens on every mute

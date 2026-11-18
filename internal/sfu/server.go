@@ -90,6 +90,9 @@ type serverMetrics struct {
 	keyFramesCollapsed  atomic.Uint64
 	// Completed RID layer switches across all subscribers.
 	simulcastSwitches atomic.Uint64
+	// REMB feedback received from subscribers; zero on a browser/transport that
+	// relies on TWCC only, which is why layer selection also uses queue pressure.
+	rembReceived atomic.Uint64
 }
 
 type revocation struct {
@@ -232,8 +235,10 @@ type subscriberSink struct {
 	selector  *layerSelector
 	rewriter  *rtpRewriter
 	rewriteMu sync.Mutex
-	// Last observed layer-set version, to avoid rebuilding availability per packet.
+	// Last observed layer-set version and time, to avoid rebuilding availability
+	// per packet while still noticing a silently disabled encoding.
 	layersVersion uint64
+	layersChecked time.Time
 }
 
 func (s *subscriberSink) close() {
@@ -287,8 +292,10 @@ func (s *subscriberSink) pushLayer(rid string, packet *rtp.Packet) {
 
 	now := time.Now()
 	s.rewriteMu.Lock()
-	if version := s.upstream.simulcast.layerVersion(); version != s.layersVersion {
+	if version := s.upstream.simulcast.layerVersion(); version != s.layersVersion ||
+		now.Sub(s.layersChecked) >= simulcastLayerSilence/4 {
 		s.layersVersion = version
+		s.layersChecked = now
 		s.selector.setAvailable(s.upstream.simulcast.layerRIDs())
 	}
 	requestRID := ""
@@ -314,6 +321,7 @@ func (s *subscriberSink) pushLayer(rid string, packet *rtp.Packet) {
 		if s.metrics != nil {
 			s.metrics.simulcastSwitches.Add(1)
 		}
+		slog.Debug("simulcast switch", "track", s.trackID, "subscriber", s.peerID, "to", rid)
 	}
 	s.rewriter.rewrite(clone)
 	data, err := clone.Marshal()
@@ -661,6 +669,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	writeCounter(w, "tarnmedia_key_frames_requested_total", s.metrics.keyFramesRequested.Load())
 	writeCounter(w, "tarnmedia_key_frames_collapsed_total", s.metrics.keyFramesCollapsed.Load())
 	writeCounter(w, "tarnmedia_simulcast_switches_total", s.metrics.simulcastSwitches.Load())
+	writeCounter(w, "tarnmedia_remb_received_total", s.metrics.rembReceived.Load())
 }
 
 func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
@@ -1335,6 +1344,7 @@ func (r *room) forward(owner *peer, remote *webrtc.TrackRemote, source string) {
 func (r *room) forwardLayer(owner *peer, remote *webrtc.TrackRemote, source string) {
 	rid := remote.RID()
 	ssrc := remote.SSRC()
+	slog.Debug("simulcast layer", "owner", owner.id, "source", source, "rid", rid, "ssrc", ssrc)
 
 	r.mu.Lock()
 	trackID := ""
@@ -1375,7 +1385,7 @@ func (r *room) forwardLayer(owner *peer, remote *webrtc.TrackRemote, source stri
 	}
 	activity := candidate.activity
 	sourceTrack := candidate.simulcast
-	sourceTrack.addLayer(rid, ssrc, remote)
+	layer := sourceTrack.addLayer(rid, ssrc, remote)
 	r.mu.Unlock()
 	if !found {
 		r.sync()
@@ -1400,6 +1410,7 @@ func (r *room) forwardLayer(owner *peer, remote *webrtc.TrackRemote, source stri
 		if err != nil {
 			return
 		}
+		layer.lastPacket.Store(time.Now().UnixNano())
 		activity.lastPacket.Store(time.Now().UnixNano())
 		if !owner.allowsPacketForwarding(source) {
 			continue
@@ -1510,6 +1521,7 @@ func (r *room) ensureSink(currentPeer *peer, candidate localTrack) (*subscriberS
 			limits = defaultLayerLimits()
 		}
 		sink.selector = newLayerSelector(limits, candidate.simulcast.layerRIDs(), "h", time.Now())
+		slog.Debug("simulcast sink", "track", trackID, "subscriber", currentPeer.id, "layers", candidate.simulcast.layerRIDs(), "start", sink.selector.current)
 		// Stable per-subscriber SSRC, sequence and timestamp across layer
 		// switches. The sender's own binding also fixes an SSRC, but sequence
 		// and timestamp continuity are ours to maintain.
@@ -2221,8 +2233,25 @@ func readSubscriberRTCP(sender *webrtc.RTPSender, sink *subscriberSink, metrics 
 			continue
 		}
 		for _, packet := range packets {
-			if remb, ok := packet.(*rtcp.ReceiverEstimatedMaximumBitrate); ok && sink.selector != nil && remb.Bitrate > 0 {
-				sink.selector.setREMB(uint32(remb.Bitrate))
+			switch report := packet.(type) {
+			case *rtcp.ReceiverEstimatedMaximumBitrate:
+				if sink.selector != nil && report.Bitrate > 0 {
+					sink.selector.setREMB(uint32(report.Bitrate))
+					if metrics != nil {
+						metrics.rembReceived.Add(1)
+					}
+				}
+			case *rtcp.ReceiverReport:
+				if sink.selector != nil {
+					worst := 0.0
+					for _, reception := range report.Reports {
+						fractionLost := float64(reception.FractionLost) / 256
+						if fractionLost > worst {
+							worst = fractionLost
+						}
+					}
+					sink.selector.noteReport(worst, time.Now())
+				}
 			}
 		}
 		if sink.video && requestsKeyFrame(packets) {

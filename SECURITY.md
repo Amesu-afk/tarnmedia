@@ -60,6 +60,6 @@ These are design gaps, not vulnerabilities, and are already documented:
   to forward it. An operator who controls the server can access call media. If
   your threat model excludes the server operator, TarnMedia is the wrong tool.
 - Simulcast is limited to RID layers for camera and screen, with selection from
-  REMB and queue pressure. There is no SVC, no TWCC-based bandwidth estimator and
-  no load-tested capacity numbers. Fan-out is isolated with bounded
-  per-subscriber queues.
+  REMB when present, receiver-report loss and queue pressure. There is no SVC, no
+  TWCC-based bandwidth estimator and no load-tested capacity numbers. Fan-out is
+  isolated with bounded per-subscriber queues.

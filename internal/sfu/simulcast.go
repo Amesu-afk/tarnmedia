@@ -25,9 +25,26 @@ import (
 const (
 	simulcastSwitchInterval = 2 * time.Second
 	simulcastGrowAfter      = 8 * time.Second
+	// A fresh subscription may learn its RID set one encoding at a time: Pion
+	// probes SSRCs as packets arrive, so f can be registered before h and q.
+	// Within this window the selector aligns to the preferred start layer even
+	// if that means moving down from a probe-time upper layer.
+	simulcastInitialRampWindow = 2 * time.Second
 	// Fraction of the reported REMB a layer may use. The rest is headroom for
 	// audio, RTCP and the burst a key frame creates.
 	simulcastREMBRatio = 9 // out of 10
+	// Chrome does not send REMB in every mode; it may rely on TWCC only. When
+	// REMB is absent, receiver reports are the bandwidth evidence: grow after a
+	// stable window without loss and fall back on real loss.
+	simulcastLossDrop = 0.05
+	simulcastLossGrow = 0.01
+	// A layer that stopped producing packets is not a layer a subscriber should
+	// be moved to. Two seconds is longer than any key-frame wait and shorter
+	// than a user noticing a frozen picture.
+	simulcastLayerSilence = 2 * time.Second
+	// A layer that had to be abandoned is not retried immediately; otherwise a
+	// link that fits h but not f would pump between them every few seconds.
+	simulcastLayerCooldown = 30 * time.Second
 	// One 30 fps frame at 90 kHz. Used only to keep the output timeline moving
 	// when the source timestamp jumps to another encoder's clock.
 	simulcastTimestampStep = 3000
@@ -56,6 +73,9 @@ type simulcastLayer struct {
 	rid    string
 	ssrc   webrtc.SSRC
 	remote *webrtc.TrackRemote
+	// lastPacket keeps a silently disabled encoding out of layer selection
+	// without removing the whole source.
+	lastPacket atomic.Int64
 	// One gate per layer: a switch to a layer asks that layer's encoder only.
 	keyFrames keyFrameGate
 }
@@ -83,6 +103,7 @@ func newSimulcastSource(owner *peer, mimeType string) *simulcastSource {
 // its camera source without renegotiating) replaces the old reader.
 func (s *simulcastSource) addLayer(rid string, ssrc webrtc.SSRC, remote *webrtc.TrackRemote) *simulcastLayer {
 	layer := &simulcastLayer{rid: rid, ssrc: ssrc, remote: remote}
+	layer.lastPacket.Store(time.Now().UnixNano())
 	s.mu.Lock()
 	s.layers[rid] = layer
 	s.mu.Unlock()
@@ -112,13 +133,19 @@ func (s *simulcastSource) layerVersion() uint64 {
 	return s.version.Load()
 }
 
-// layerRIDs returns the RIDs that are currently arriving.
+// layerRIDs returns the RIDs that are currently arriving. A stale encoding is
+// excluded after simulcastLayerSilence; it may resume later without touching
+// the rest of the source.
 func (s *simulcastSource) layerRIDs() []string {
+	now := time.Now()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rids := make([]string, 0, len(s.layers))
-	for rid := range s.layers {
-		rids = append(rids, rid)
+	for rid, layer := range s.layers {
+		last := layer.lastPacket.Load()
+		if last == 0 || now.Sub(time.Unix(0, last)) <= simulcastLayerSilence {
+			rids = append(rids, rid)
+		}
 	}
 	return rids
 }
@@ -179,15 +206,20 @@ type layerSelector struct {
 	// startRID is the layer a fresh subscription prefers. If it appears after a
 	// smaller layer (Chrome starts q before h), the selector promotes to it
 	// without waiting for a full growth window.
-	startRID    string
-	remb        uint32
-	lastDrop    time.Time
-	lastSwitch  time.Time
-	stableSince time.Time
+	startRID  string
+	startedAt time.Time
+	remb      uint32
+	loss      float64
+	// blockedAbove is the layer that had to be abandoned and its retry deadline.
+	blockedAbove string
+	blockedUntil time.Time
+	lastDrop     time.Time
+	lastSwitch   time.Time
+	stableSince  time.Time
 }
 
 func newLayerSelector(limits []layerLimit, available []string, preferred string, now time.Time) *layerSelector {
-	selector := &layerSelector{limits: limits, stableSince: now, startRID: preferred}
+	selector := &layerSelector{limits: limits, stableSince: now, startRID: preferred, startedAt: now}
 	selector.available = make(map[string]bool, len(available))
 	for _, rid := range available {
 		selector.available[rid] = true
@@ -263,9 +295,35 @@ func (s *layerSelector) setAvailable(rids []string) {
 
 func (s *layerSelector) noteDrop(now time.Time) {
 	s.mu.Lock()
+	s.noteDropLocked(now)
+	s.mu.Unlock()
+}
+
+// noteDropLocked records congestion pressure. The layer we are leaving is not
+// retried for a cooldown: a link that fits h but not f must not pump f every
+// few seconds.
+func (s *layerSelector) noteDropLocked(now time.Time) {
+	if s.current != "" && s.rankOf(s.current) > 0 {
+		s.blockedAbove = s.current
+		s.blockedUntil = now.Add(simulcastLayerCooldown)
+	}
 	s.lastDrop = now
 	s.stableSince = now
-	s.mu.Unlock()
+}
+
+// noteReport consumes the fraction lost from a subscriber's receiver report.
+// Chrome may not send REMB at all; RR loss is then the only bandwidth evidence
+// besides our own queue.
+func (s *layerSelector) noteReport(fractionLost float64, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if fractionLost < 0 {
+		fractionLost = 0
+	}
+	s.loss = fractionLost
+	if fractionLost >= simulcastLossDrop {
+		s.noteDropLocked(now)
+	}
 }
 
 func (s *layerSelector) setREMB(bits uint32) {
@@ -297,6 +355,13 @@ func (s *layerSelector) nextSwitch(now time.Time) (string, bool) {
 		}
 		s.beginSwitch(target, now)
 		return target, true
+	}
+	// Align a subscription that was created from a partial RID set (see the
+	// constant). This can be a downgrade: the first probed SSRC is often f.
+	if s.lastSwitch.IsZero() && now.Sub(s.startedAt) < simulcastInitialRampWindow &&
+		s.available[s.startRID] && s.current != s.startRID {
+		s.beginSwitch(s.startRID, now)
+		return s.startRID, true
 	}
 	if !s.lastSwitch.IsZero() && now.Sub(s.lastSwitch) < simulcastSwitchInterval {
 		return "", false
@@ -364,17 +429,19 @@ func (s *layerSelector) priorityRID() string {
 
 func (s *layerSelector) wantedLayer(now time.Time) string {
 	if s.remb == 0 {
-		// No bandwidth evidence at all: stay where we are, except for the
-		// initial ramp. Chrome often announces q before h, and a subscriber
-		// that starts on q should move to h once the preferred layer appears.
+		// No REMB: Chrome may rely on TWCC only. Grow one step after a stable,
+		// lossless window; any real loss or queue drop already reset the window.
 		wanted := s.current
-		if s.available[s.startRID] && s.rankOf(s.startRID) > s.rankOf(wanted) {
-			wanted = s.startRID
+		healthy := s.loss <= simulcastLossGrow && now.Sub(s.stableSince) >= simulcastGrowAfter
+		if healthy {
+			if next := s.nextAbove(s.rankOf(wanted)); next != "" {
+				wanted = next
+			}
 		}
 		if !s.lastDrop.IsZero() && now.Sub(s.lastDrop) < simulcastGrowAfter {
-			return s.lowerThan(s.rankOf(wanted))
+			wanted = s.lowerThan(s.rankOf(wanted))
 		}
-		return wanted
+		return s.capBlocked(wanted, now)
 	}
 	budget := uint64(s.remb) * simulcastREMBRatio / 10
 	candidate := ""
@@ -391,7 +458,33 @@ func (s *layerSelector) wantedLayer(now time.Time) string {
 			candidate = s.lowerThan(s.rankOf(s.current))
 		}
 	}
-	return candidate
+	return s.capBlocked(candidate, now)
+}
+
+// capBlocked keeps a failed layer and everything above it out of the choice
+// until its cooldown expires.
+func (s *layerSelector) capBlocked(wanted string, now time.Time) string {
+	if s.blockedAbove == "" || !now.Before(s.blockedUntil) || wanted == "" {
+		return wanted
+	}
+	if s.rankOf(wanted) < s.rankOf(s.blockedAbove) {
+		return wanted
+	}
+	for index := s.rankOf(s.blockedAbove) - 1; index >= 0; index-- {
+		if s.available[s.limits[index].rid] {
+			return s.limits[index].rid
+		}
+	}
+	return wanted
+}
+
+func (s *layerSelector) nextAbove(rank int) string {
+	for index := rank + 1; index < len(s.limits); index++ {
+		if s.available[s.limits[index].rid] {
+			return s.limits[index].rid
+		}
+	}
+	return ""
 }
 
 func (s *layerSelector) lowerThan(rank int) string {

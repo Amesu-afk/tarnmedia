@@ -14,8 +14,9 @@ It powers calls and voice rooms in [TarnVeil](https://tarnveil.ru) and is availa
 25 participants) and has unit tests, but:
 
 - **simulcast is supported for camera and screen**, with per-subscriber layer
-  selection (`q`/`h`/`f`) driven by REMB and queue pressure. It is a first step,
-  not full congestion control: there is no TWCC-based bandwidth estimator, and a
+  selection (`q`/`h`/`f`) driven by REMB when the browser sends it, otherwise by
+  receiver-report loss and queue pressure. It is a first step, not full
+  congestion control: there is no TWCC-based bandwidth estimator, and a
   subscriber starts on `h` and switches with a 2 s guard and a key-frame wait;
 - fan-out itself is isolated: each subscriber has a bounded queue and its own
   worker. A slow transport drops its own packets (video requests a key frame)

@@ -51,6 +51,30 @@ func TestSimulcastSourceGroupsRIDLayersUnderOneLogicalTrack(t *testing.T) {
 	}
 }
 
+func TestSimulcastSourceExcludesSilentLayers(t *testing.T) {
+	source := newSimulcastSource(&peer{id: "pub"}, webrtc.MimeTypeVP8)
+	source.addLayer("q", 10, nil)
+	source.addLayer("h", 20, nil)
+	source.addLayer("f", 30, nil)
+	source.layer("f").lastPacket.Store(time.Now().Add(-simulcastLayerSilence - time.Second).UnixNano())
+
+	rids := source.layerRIDs()
+	if len(rids) != 2 {
+		t.Fatalf("active layers = %v, want q and h", rids)
+	}
+	for _, rid := range rids {
+		if rid == "f" {
+			t.Fatal("a silent layer must not be offered for selection")
+		}
+	}
+
+	// A resumed encoding is eligible again without a new OnTrack.
+	source.layer("f").lastPacket.Store(time.Now().UnixNano())
+	if got := len(source.layerRIDs()); got != 3 {
+		t.Fatalf("active layers after resume = %d, want 3", got)
+	}
+}
+
 func TestRTPRewriterKeepsStreamContinuousAcrossLayers(t *testing.T) {
 	rewriter := newRTPRewriter(0xFFFF) // sequence starts at 65535, so wrap is covered
 	first := &rtp.Packet{
@@ -205,6 +229,58 @@ func TestLayerSelectorRampsFromEarlyLowLayerToStartLayer(t *testing.T) {
 	}
 	if send, switched := selector.accept("h", true, now.Add(150*time.Millisecond)); !send || !switched {
 		t.Fatal("h key frame must complete the initial ramp")
+	}
+}
+
+func TestLayerSelectorAlignsToStartLayerWhenProbesArriveOutOfOrder(t *testing.T) {
+	now := time.Unix(4600, 0)
+	// Pion may register f before h and q, so the sink starts on f.
+	selector := newLayerSelector(testLayerLimits(), []string{"f"}, "h", now)
+	if selector.current != "f" {
+		t.Fatalf("initial layer = %q, want f", selector.current)
+	}
+	selector.setAvailable([]string{"q", "h", "f"})
+	target, ok := selector.nextSwitch(now.Add(100 * time.Millisecond))
+	if !ok || target != "h" {
+		t.Fatalf("alignment target = %q, ok = %t; want h", target, ok)
+	}
+	if send, switched := selector.accept("h", true, now.Add(200*time.Millisecond)); !send || !switched {
+		t.Fatal("h key frame must complete the alignment")
+	}
+}
+
+func TestLayerSelectorGrowsOnLosslessReportsWithoutREMB(t *testing.T) {
+	now := time.Unix(6000, 0)
+	selector := newLayerSelector(testLayerLimits(), []string{"q", "h", "f"}, "h", now)
+	selector.accept("h", true, now)
+	// Chrome may not send REMB; a lossless receiver report is the growth signal.
+	selector.noteReport(0, now)
+	if _, ok := selector.nextSwitch(now.Add(4 * time.Second)); ok {
+		t.Fatal("growth before the stable window must be refused")
+	}
+	target, ok := selector.nextSwitch(now.Add(simulcastGrowAfter))
+	if !ok || target != "f" {
+		t.Fatalf("target = %q, ok = %t; want f", target, ok)
+	}
+	if send, switched := selector.accept("f", true, now.Add(simulcastGrowAfter)); !send || !switched {
+		t.Fatal("f key frame must complete the growth")
+	}
+
+	// Real loss must degrade immediately (after the 2 s guard) and remember
+	// that f was too big.
+	selector.noteReport(0.10, now.Add(9*time.Second))
+	target, ok = selector.nextSwitch(now.Add(11 * time.Second))
+	if !ok || target != "h" {
+		t.Fatalf("degradation target = %q, ok = %t; want h", target, ok)
+	}
+	selector.accept("h", true, now.Add(11*time.Second))
+	selector.noteReport(0, now.Add(12*time.Second))
+	// Even with a long lossless window f stays out until the cooldown.
+	if target, ok = selector.nextSwitch(now.Add(30 * time.Second)); ok {
+		t.Fatalf("f was retried during the cooldown: %q", target)
+	}
+	if target, ok = selector.nextSwitch(now.Add(simulcastLayerCooldown + 12*time.Second)); !ok || target != "f" {
+		t.Fatalf("after cooldown target = %q, ok = %t; want f", target, ok)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,15 @@ import (
 	"github.com/tarnveil/tarnmedia/internal/auth"
 	"github.com/tarnveil/tarnmedia/internal/config"
 )
+
+// guardPanic keeps one broken callback from crashing the whole SFU. Pion invokes
+// callbacks and our readers on goroutines we do not own, so an unexpected panic
+// there would otherwise take down every active call in the process.
+func guardPanic(where string) {
+	if recovered := recover(); recovered != nil {
+		slog.Error("recovered panic", "where", where, "panic", recovered, "stack", string(debug.Stack()))
+	}
+}
 
 const (
 	maxSignalMessageBytes  = 1 << 20
@@ -330,14 +340,19 @@ func (s *Server) RunMaintenance(stop <-chan struct{}) {
 	defer pingTicker.Stop()
 	defer stallTicker.Stop()
 	defer cleanupTicker.Stop()
+	// A panic in one maintenance pass must not take down signaling for every call.
+	safe := func(where string, job func()) {
+		defer guardPanic(where)
+		job()
+	}
 	for {
 		select {
 		case <-pingTicker.C:
-			s.pingPeers()
+			safe("maintenance-ping", s.pingPeers)
 		case <-stallTicker.C:
-			s.checkMediaStalls(time.Now())
+			safe("maintenance-stall", func() { s.checkMediaStalls(time.Now()) })
 		case <-cleanupTicker.C:
-			s.cleanupRevocations()
+			safe("maintenance-cleanup", s.cleanupRevocations)
 		case <-stop:
 			return
 		}
@@ -895,9 +910,13 @@ func (s *Server) join(claims auth.Claims, conn *websocket.Conn) (*peer, error) {
 	currentRoom.mu.Unlock()
 
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		// Gathering and teardown both invoke this; a panic here must not stop
+		// the SFU for everyone else.
+		defer guardPanic("ice-candidate")
 		if candidate != nil {
 			// Serialize candidate writes after the offer that caused gathering.
 			go func() {
+				defer guardPanic("ice-candidate-write")
 				currentPeer.signalMu.Lock()
 				defer currentPeer.signalMu.Unlock()
 				_ = currentPeer.write("candidate", candidate.ToJSON())
@@ -905,6 +924,7 @@ func (s *Server) join(claims auth.Claims, conn *websocket.Conn) (*peer, error) {
 		}
 	})
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		defer guardPanic("connection-state")
 		slog.Info("peer state changed", "room", claims.Room, "peer", claims.ParticipantID, "state", state.String())
 		switch state {
 		case webrtc.PeerConnectionStateConnected:
@@ -921,6 +941,9 @@ func (s *Server) join(claims auth.Claims, conn *websocket.Conn) (*peer, error) {
 		}
 	})
 	pc.OnTrack(func(remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		// forward blocks for the lifetime of the track; recovering here keeps a
+		// malformed RTP path from killing every other call.
+		defer guardPanic("on-track")
 		source := currentPeer.receiveSources[receiver]
 		if source == "" {
 			slog.Warn("received track on unknown transceiver", "room", claims.Room, "peer", claims.ParticipantID)
@@ -1109,7 +1132,10 @@ func (r *room) syncPeer(currentPeer *peer, available map[string]localTrack) erro
 		if err != nil {
 			return err
 		}
-		go readSubscriberRTCP(sender, candidate, r.metrics)
+		go func() {
+			defer guardPanic("subscriber-rtcp")
+			readSubscriberRTCP(sender, candidate, r.metrics)
+		}()
 		if candidate.keyFrames != nil {
 			currentPeer.pendingKeyFrames = append(currentPeer.pendingKeyFrames, candidate)
 		}
@@ -1454,6 +1480,7 @@ func (p *peer) settleICERecovery() {
 }
 
 func (p *peer) recoverICE() {
+	defer guardPanic("ice-recovery")
 	p.recoveryMu.Lock()
 	p.recoveryTimer = nil
 	attempts := p.iceRestarts
@@ -1553,7 +1580,10 @@ func (p *peer) allowSignal() bool {
 // so it is passed upstream. Reading must continue regardless: an unread stream
 // eventually stalls the sender.
 func readSubscriberRTCP(sender *webrtc.RTPSender, upstream localTrack, metrics *serverMetrics) {
-	buffer := make([]byte, 1500)
+	// 1500 bytes was too small for a compound RTCP packet from a subscriber in a
+	// busy room: Read then returned a short-buffer error, this reader exited, and
+	// PLI/FIR never reached the publisher again until the next renegotiation.
+	buffer := make([]byte, 8192)
 	for {
 		n, _, err := sender.Read(buffer)
 		if err != nil {

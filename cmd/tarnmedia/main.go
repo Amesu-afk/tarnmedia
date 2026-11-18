@@ -65,9 +65,13 @@ func main() {
 	mediaServer.SetReady(false)
 	close(stopMaintenance)
 
+	// Close peers and their websockets BEFORE http.Server.Shutdown: Shutdown does
+	// not unblock websocket handlers, so the old order waited the full timeout
+	// while existing calls stayed frozen.
+	mediaServer.Close()
+
 	ctx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	_ = publicServer.Shutdown(ctx)
 	_ = controlServer.Shutdown(ctx)
-	mediaServer.Close()
 }

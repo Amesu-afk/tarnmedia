@@ -5,26 +5,41 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/tarnveil/tarnmedia/internal/auth"
 )
 
+// SimulcastLayer is one RID encoding a publisher may send. Bitrate is the
+// budget the layer needs on a subscriber's link; the layer selector uses it to
+// choose the highest layer that fits.
+type SimulcastLayer struct {
+	RID     string
+	Bitrate uint32
+}
+
 type Config struct {
-	Addr            string
-	ControlAddr     string
-	ControlSecret   string
-	AuthURL         string
-	JWTSecret       string
-	Issuer          string
-	AllowedOrigins  map[string]struct{}
-	PublicIP        string
-	UDPMin          uint16
-	UDPMax          uint16
+	Addr           string
+	ControlAddr    string
+	ControlSecret  string
+	AuthURL        string
+	JWTSecret      string
+	Issuer         string
+	AllowedOrigins map[string]struct{}
+	PublicIP       string
+	UDPMin         uint16
+	UDPMax         uint16
 	// Один UDP-порт, который слушает ICE-мультиплексор: все PeerConnection
 	// делят его, поэтому потолок в ~100 пиров из диапазона порогов снят.
-	UDPPort         uint16
+	UDPPort uint16
+	// Simulcast включает приём RID-слоёв и выбор слоя. При выключенном флаге
+	// сервер ведёт себя как раньше: один слой и SFU-offer с recvonly-слотами.
+	Simulcast bool
+	// SimulcastLayers — пороги слоёв по возрастанию битрейта. Общие для сервера
+	// и клиента, чтобы выбор слоя не разъезжался с тем, что реально отправляется.
+	SimulcastLayers []SimulcastLayer
 	ICEURLs         []string
 	ICEUsername     string
 	ICECredential   string
@@ -96,6 +111,17 @@ func Load() (Config, error) {
 	if cfg.MaxPeersPerRoom < 2 || cfg.MaxPeersPerRoom > 100 {
 		return Config{}, fmt.Errorf("TARNMEDIA_MAX_PEERS_PER_ROOM must be between 2 and 100")
 	}
+
+	simulcast, err := envBool("TARNMEDIA_SIMULCAST", true)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Simulcast = simulcast
+	layers, err := parseSimulcastLayers(env("TARNMEDIA_SIMULCAST_LAYERS", "q=150000,h=400000,f=1200000"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.SimulcastLayers = layers
 
 	// Keep default ICE/STUN traffic outside common Discord interception profiles.
 	min, err := envUint16("TARNMEDIA_UDP_MIN", 42000)
@@ -190,4 +216,56 @@ func envUint16(name string, fallback uint16) (uint16, error) {
 		return 0, fmt.Errorf("%s must be a valid UDP port", name)
 	}
 	return uint16(parsed), nil
+}
+
+func envBool(name string, fallback bool) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "":
+		return fallback, nil
+	case "1", "on", "true", "yes":
+		return true, nil
+	case "0", "off", "false", "no":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be on or off", name)
+	}
+}
+
+// parseSimulcastLayers reads "rid=bitrate,rid=bitrate" and returns the layers
+// ordered by bitrate. The order is the selector's ordering: q < h < f.
+func parseSimulcastLayers(value string) ([]SimulcastLayer, error) {
+	parts := strings.Split(value, ",")
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("TARNMEDIA_SIMULCAST_LAYERS must list at least one layer")
+	}
+	seen := make(map[string]struct{}, len(parts))
+	layers := make([]SimulcastLayer, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("TARNMEDIA_SIMULCAST_LAYERS contains an empty layer")
+		}
+		rid, rawBitrate, ok := strings.Cut(part, "=")
+		rid = strings.TrimSpace(rid)
+		rawBitrate = strings.TrimSpace(rawBitrate)
+		if !ok || rid == "" || len(rid) > 16 || rawBitrate == "" {
+			return nil, fmt.Errorf("invalid simulcast layer %q, want rid=bitrate", part)
+		}
+		for _, current := range rid {
+			if (current < 'a' || current > 'z') && (current < 'A' || current > 'Z') && (current < '0' || current > '9') {
+				return nil, fmt.Errorf("invalid simulcast layer id %q", rid)
+			}
+		}
+		if _, duplicate := seen[rid]; duplicate {
+			return nil, fmt.Errorf("duplicate simulcast layer id %q", rid)
+		}
+		parsed, err := strconv.ParseUint(rawBitrate, 10, 32)
+		if err != nil || parsed == 0 || parsed > 100_000_000 {
+			return nil, fmt.Errorf("invalid bitrate for simulcast layer %q", rid)
+		}
+		seen[rid] = struct{}{}
+		layers = append(layers, SimulcastLayer{RID: rid, Bitrate: uint32(parsed)})
+	}
+	sort.Slice(layers, func(i, j int) bool { return layers[i].Bitrate < layers[j].Bitrate })
+	return layers, nil
 }

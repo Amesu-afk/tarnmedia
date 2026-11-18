@@ -1929,7 +1929,7 @@ func (p *peer) handlePublishOffer(data json.RawMessage) error {
 			p.signalMu.Unlock()
 			return fmt.Errorf("publish source %q is mapped twice", source)
 		}
-		if track := receiver.Track(); track != nil && track.Kind() != kind {
+		if transceiver.Kind() != kind {
 			p.signalMu.Unlock()
 			return fmt.Errorf("publish source %q does not match its m-line kind", source)
 		}

@@ -118,10 +118,10 @@ func TestAbruptPeerLeaveAndReconnectKeepsRemainingRTP(t *testing.T) {
 	waitPacketCount(t, ctx, c, "peer-a", aPacketsBeforeRejoin+5)
 	waitPacketCount(t, ctx, c, "peer-b", bPacketsBeforeRejoin+10)
 
-	if state := b.pc.ConnectionState(); state != webrtc.PeerConnectionStateConnected {
+	if state := waitPeerConnected(t, ctx, b); state != webrtc.PeerConnectionStateConnected {
 		t.Fatalf("remaining publisher B state after A rejoined = %s, want connected", state)
 	}
-	if state := c.pc.ConnectionState(); state != webrtc.PeerConnectionStateConnected {
+	if state := waitPeerConnected(t, ctx, c); state != webrtc.PeerConnectionStateConnected {
 		t.Fatalf("remaining subscriber C state after A rejoined = %s, want connected", state)
 	}
 }
@@ -186,7 +186,7 @@ func TestICERestartKeepsTheCallAndRefreshesCredentials(t *testing.T) {
 	}
 	// The restarted transport must keep carrying media instead of ending the call.
 	waitPacketCount(t, ctx, b, "peer-a", packetsBeforeRestart+5)
-	if state := b.pc.ConnectionState(); state != webrtc.PeerConnectionStateConnected {
+	if state := waitPeerConnected(t, ctx, b); state != webrtc.PeerConnectionStateConnected {
 		t.Fatalf("peer B state after ICE restart = %s, want connected", state)
 	}
 }
@@ -484,6 +484,26 @@ func waitLifecycleConnected(t *testing.T, ctx context.Context, p *lifecyclePeer)
 		t.Fatalf("peer %s signaling failed before connection: %v", p.id, err)
 	case <-ctx.Done():
 		t.Fatalf("peer %s did not connect before deadline: state=%s", p.id, p.pc.ConnectionState())
+	}
+}
+
+// waitPeerConnected polls the transport state. After an ICE restart Pion can
+// report "connecting" for a moment even though packets already flow, so a
+// single immediate check made the test fail depending on scheduling.
+func waitPeerConnected(t *testing.T, ctx context.Context, p *lifecyclePeer) webrtc.PeerConnectionState {
+	t.Helper()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		state := p.pc.ConnectionState()
+		if state == webrtc.PeerConnectionStateConnected || state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
+			return state
+		}
+		select {
+		case <-ctx.Done():
+			return state
+		case <-ticker.C:
+		}
 	}
 }
 

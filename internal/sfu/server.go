@@ -82,12 +82,14 @@ type serverMetrics struct {
 	forwardWriteFailures atomic.Uint64
 	// Packets dropped because a subscriber's bounded queue was full. This is the
 	// operational signal of a slow transport (per-subscriber backpressure).
-	subscriberDrops      atomic.Uint64
-	controlRequests      atomic.Uint64
-	controlAuthFailures  atomic.Uint64
-	evictedPeers         atomic.Uint64
-	keyFramesRequested   atomic.Uint64
-	keyFramesCollapsed   atomic.Uint64
+	subscriberDrops     atomic.Uint64
+	controlRequests     atomic.Uint64
+	controlAuthFailures atomic.Uint64
+	evictedPeers        atomic.Uint64
+	keyFramesRequested  atomic.Uint64
+	keyFramesCollapsed  atomic.Uint64
+	// Completed RID layer switches across all subscribers.
+	simulcastSwitches atomic.Uint64
 }
 
 type revocation struct {
@@ -120,6 +122,27 @@ type signalMessage struct {
 
 type authenticateData struct {
 	Token string `json:"token"`
+	// publish marks a client that negotiates its media slots as the offerer.
+	// Without it the server keeps the original behaviour: it offers recvonly
+	// slots itself. The field is additive, so older clients stay on that path.
+	Publish bool `json:"publish"`
+	// simulcast asks for RID layers. It is only meaningful together with
+	// publish and only honoured when TARNMEDIA_SIMULCAST is on.
+	Simulcast bool `json:"simulcast"`
+}
+
+// clientHello is what authenticate may negotiate beyond the token.
+type clientHello struct {
+	publish   bool
+	simulcast bool
+}
+
+// publishOfferData is the client's offer for its own media slots. midToSource
+// replaces the server's old m-line-order convention: the publisher is the only
+// side that knows which transceiver carries which source after it creates them.
+type publishOfferData struct {
+	SDP         webrtc.SessionDescription `json:"sdp"`
+	MidToSource map[string]string         `json:"midToSource"`
 }
 
 type mediaState struct {
@@ -165,6 +188,9 @@ type localTrack struct {
 	owner     *peer
 	ssrc      webrtc.SSRC
 	keyFrames *keyFrameGate
+	// simulcast is set on a logical video track fed by RID layers. The room maps
+	// and SDP carry one localTrack per (owner, source); the layers live inside.
+	simulcast *simulcastSource
 	// Shared with the forwarding loop (the struct itself is copied into the room
 	// maps), so the stall watchdog sees live packet timing.
 	activity *trackActivity
@@ -191,16 +217,23 @@ const (
 // worker writes it to that subscriber's TrackLocalStaticRTP. A blocked or broken
 // transport therefore cannot delay packets for other subscribers.
 type subscriberSink struct {
-	room     *room
-	trackID  string
-	peerID   string
-	track    *webrtc.TrackLocalStaticRTP
-	queue    chan []byte
-	done     chan struct{}
+	room      *room
+	trackID   string
+	peerID    string
+	track     *webrtc.TrackLocalStaticRTP
+	queue     chan []byte
+	done      chan struct{}
 	closeOnce sync.Once
-	upstream localTrack
-	video    bool
-	metrics  *serverMetrics
+	upstream  localTrack
+	video     bool
+	metrics   *serverMetrics
+	// Set for a simulcast video source: one logical track, per-subscriber layer
+	// choice, and sequence/timestamp continuity across switches.
+	selector  *layerSelector
+	rewriter  *rtpRewriter
+	rewriteMu sync.Mutex
+	// Last observed layer-set version, to avoid rebuilding availability per packet.
+	layersVersion uint64
 }
 
 func (s *subscriberSink) close() {
@@ -217,16 +250,111 @@ func (s *subscriberSink) push(data []byte) {
 	case s.queue <- data:
 	case <-s.done:
 	default:
-		if s.metrics != nil {
-			s.metrics.subscriberDrops.Add(1)
+		s.recordDrop()
+	}
+}
+
+// recordDrop accounts for a packet lost to a full queue and asks for a key
+// frame, since the subscriber's decoder has no way to recover the gap.
+func (s *subscriberSink) recordDrop() {
+	if s.metrics != nil {
+		s.metrics.subscriberDrops.Add(1)
+	}
+	if s.selector != nil {
+		s.selector.noteDrop(time.Now())
+	}
+	// Video recovers from a key frame; request one at most as often as the
+	// key frame gate allows. Audio has no equivalent, so its queue is longer
+	// and a drop there is a genuinely overloaded consumer.
+	if s.video {
+		s.requestKeyFrame(s.metrics)
+	}
+}
+
+// pushLayer forwards one packet of a RID layer. Only the layer this
+// subscriber currently watches is rewritten and queued; the others are read
+// and dropped, because the publisher necessarily uploads all of them.
+func (s *subscriberSink) pushLayer(rid string, packet *rtp.Packet) {
+	if s.selector == nil {
+		s.pushMarshaled(packet)
+		return
+	}
+	select {
+	case <-s.done:
+		return
+	default:
+	}
+
+	now := time.Now()
+	s.rewriteMu.Lock()
+	if version := s.upstream.simulcast.layerVersion(); version != s.layersVersion {
+		s.layersVersion = version
+		s.selector.setAvailable(s.upstream.simulcast.layerRIDs())
+	}
+	requestRID := ""
+	if target, wanted := s.selector.nextSwitch(now); wanted {
+		requestRID = target
+	}
+	send, switched := s.selector.accept(rid, isKeyFrame(packet, s.upstream.simulcast.mimeType), now)
+	if !send {
+		s.rewriteMu.Unlock()
+		if requestRID != "" {
+			s.upstream.simulcast.requestKeyFrame(requestRID, s.metrics)
 		}
-		// Video recovers from a key frame; request one at most as often as the
-		// key frame gate allows. Audio has no equivalent, so its queue is longer
-		// and a drop there is a genuinely overloaded consumer.
-		if s.video {
-			s.upstream.requestKeyFrame(s.metrics)
+		return
+	}
+	clone := packet.Clone()
+	// RID/MID extensions describe the publisher's simulcast m-line, not this
+	// subscriber's single-layer downlink. Carrying them over would only confuse
+	// the receiver.
+	clone.Extension = false
+	clone.Extensions = nil
+	if switched {
+		s.rewriter.beginLayerSwitch()
+		if s.metrics != nil {
+			s.metrics.simulcastSwitches.Add(1)
 		}
 	}
+	s.rewriter.rewrite(clone)
+	data, err := clone.Marshal()
+	s.rewriteMu.Unlock()
+	if err != nil {
+		return
+	}
+	s.pushMarshaledBytes(data)
+	if requestRID != "" {
+		s.upstream.simulcast.requestKeyFrame(requestRID, s.metrics)
+	}
+}
+
+func (s *subscriberSink) pushMarshaled(packet *rtp.Packet) {
+	data, err := packet.Marshal()
+	if err != nil {
+		return
+	}
+	s.pushMarshaledBytes(data)
+}
+
+func (s *subscriberSink) pushMarshaledBytes(data []byte) {
+	select {
+	case <-s.done:
+		return
+	default:
+	}
+	select {
+	case s.queue <- data:
+	case <-s.done:
+	default:
+		s.recordDrop()
+	}
+}
+
+func (s *subscriberSink) requestKeyFrame(metrics *serverMetrics) {
+	if s.upstream.simulcast != nil {
+		s.upstream.simulcast.requestKeyFrame(s.selector.priorityRID(), metrics)
+		return
+	}
+	s.upstream.requestKeyFrame(metrics)
 }
 
 func (s *subscriberSink) run() {
@@ -272,6 +400,10 @@ func (g *keyFrameGate) allow(now time.Time) bool {
 // requestKeyFrame asks the publisher of this uplink for a key frame. Subscribers ask
 // for one when they cannot decode; the SFU does not decode and cannot tell on its own.
 func (t localTrack) requestKeyFrame(metrics *serverMetrics) {
+	if t.simulcast != nil {
+		t.simulcast.requestDefaultKeyFrame(metrics)
+		return
+	}
 	if t.keyFrames == nil || t.owner == nil || t.owner.pc == nil {
 		return
 	}
@@ -290,10 +422,13 @@ func (t localTrack) requestKeyFrame(metrics *serverMetrics) {
 type room struct {
 	id       string
 	maxPeers int
-	mu       sync.Mutex
-	peers    map[string]*peer
-	uplinks  map[string]localTrack
-	tracks   map[string]localTrack
+	// simulcast mirrors the server flag; layers are the shared RID thresholds.
+	simulcast bool
+	layers    []layerLimit
+	mu        sync.Mutex
+	peers     map[string]*peer
+	uplinks   map[string]localTrack
+	tracks    map[string]localTrack
 	// trackID -> subscriber peerID -> private sink. Every subscriber gets its own
 	// TrackLocalStaticRTP and a bounded queue, so one slow transport cannot stall
 	// the publisher's read loop for everyone else.
@@ -307,14 +442,24 @@ type peer struct {
 	room           *room
 	pc             *webrtc.PeerConnection
 	ws             *websocket.Conn
+	receiveMu      sync.RWMutex
 	receiveSources map[*webrtc.RTPReceiver]string
+	// publish marks a client that offered its own media slots (simulcast) and
+	// publishReady marks the answer that completed that handshake. Downstream
+	// offers must wait for publishReady: two offers crossing on one transport
+	// is a glare neither side can resolve.
+	publisher    bool
+	publishReady bool
+	// simulcast says the publisher asked for RID layers. A publish client that
+	// did not (Android WebView) is still accepted, just as a single layer.
+	simulcast bool
 
-	writeMu                 sync.Mutex
-	signalMu                sync.Mutex
-	stateMu                 sync.RWMutex
-	state                   mediaState
-	closed                  sync.Once
-	offered                 bool
+	writeMu  sync.Mutex
+	signalMu sync.Mutex
+	stateMu  sync.RWMutex
+	state    mediaState
+	closed   sync.Once
+	offered  bool
 	// A track snapshot arrived while SDP was busy. Guarded by signalMu, like
 	// the negotiation state it belongs to; the answer handler repeats the sync.
 	syncDirty               bool
@@ -347,6 +492,12 @@ func New(cfg config.Config) (*Server, error) {
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		return nil, fmt.Errorf("register WebRTC codecs: %w", err)
+	}
+	// Simulcast needs the MID and RID header extensions on the receiving side:
+	// without them Pion cannot attribute an RTP stream to a layer, and OnTrack
+	// arrives with an empty RID.
+	if err := webrtc.ConfigureSimulcastExtensionHeaders(mediaEngine); err != nil {
+		return nil, fmt.Errorf("register simulcast header extensions: %w", err)
 	}
 	interceptors := &interceptor.Registry{}
 	if err := webrtc.RegisterDefaultInterceptors(mediaEngine, interceptors); err != nil {
@@ -509,6 +660,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	writeCounter(w, "tarnmedia_evicted_peers_total", s.metrics.evictedPeers.Load())
 	writeCounter(w, "tarnmedia_key_frames_requested_total", s.metrics.keyFramesRequested.Load())
 	writeCounter(w, "tarnmedia_key_frames_collapsed_total", s.metrics.keyFramesCollapsed.Load())
+	writeCounter(w, "tarnmedia_simulcast_switches_total", s.metrics.simulcastSwitches.Load())
 }
 
 func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
@@ -793,7 +945,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(maxSignalMessageBytes)
 	_ = conn.SetReadDeadline(time.Now().Add(8 * time.Second))
 
-	claims, err := s.authenticate(conn)
+	claims, hello, err := s.authenticate(conn)
 	if err != nil {
 		s.metrics.authFailures.Add(1)
 		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, err.Error()), time.Now().Add(time.Second))
@@ -802,7 +954,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
-	currentPeer, err := s.join(claims, conn)
+	currentPeer, err := s.join(claims, hello, conn)
 	if err != nil {
 		s.metrics.rejectedConnections.Add(1)
 		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, err.Error()), time.Now().Add(time.Second))
@@ -820,8 +972,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		"participantId":   claims.ParticipantID,
 		"userId":          claims.UserID,
 		"protocolVersion": 1,
+		// publish advertises the client-offer handshake; an older client ignores
+		// it and keeps answering the server's recvonly offer.
+		"publish":   s.cfg.Simulcast,
+		"simulcast": s.cfg.Simulcast,
 	})
 	currentPeer.room.broadcastParticipants()
+	// A publishing peer gets its downlink offer only after publish_answer; syncPeer
+	// remembers this call in syncDirty until the publish handshake completes.
 	currentPeer.room.sync()
 
 	for {
@@ -861,26 +1019,33 @@ func signalingCloseReason(err error) string {
 	}
 	return "transport-or-protocol-error"
 }
-func (s *Server) authenticate(conn *websocket.Conn) (auth.Claims, error) {
+func (s *Server) authenticate(conn *websocket.Conn) (auth.Claims, clientHello, error) {
 	message := signalMessage{}
 	if err := conn.ReadJSON(&message); err != nil {
-		return auth.Claims{}, errors.New("authentication message required")
+		return auth.Claims{}, clientHello{}, errors.New("authentication message required")
 	}
 	if message.Event != "authenticate" {
-		return auth.Claims{}, errors.New("first message must be authenticate")
+		return auth.Claims{}, clientHello{}, errors.New("first message must be authenticate")
 	}
 	data := authenticateData{}
 	if err := json.Unmarshal(message.Data, &data); err != nil || data.Token == "" {
-		return auth.Claims{}, errors.New("media token required")
+		return auth.Claims{}, clientHello{}, errors.New("media token required")
 	}
 	claims, err := auth.Parse(data.Token, s.cfg.JWTSecret, s.cfg.Issuer)
 	if err != nil {
-		return auth.Claims{}, err
+		return auth.Claims{}, clientHello{}, err
 	}
 	if err := s.validateSession(claims); err != nil {
-		return auth.Claims{}, err
+		return auth.Claims{}, clientHello{}, err
 	}
-	return claims, nil
+	// The publish handshake is part of the simulcast feature. With the feature
+	// off the server behaves exactly as before, even if a newer client asks.
+	hello := clientHello{}
+	if s.cfg.Simulcast {
+		hello.publish = data.Publish
+		hello.simulcast = data.Publish && data.Simulcast
+	}
+	return claims, hello, nil
 }
 
 var (
@@ -936,7 +1101,7 @@ func (s *Server) requestSessionValidation(payload []byte) error {
 	return errSessionInactive
 }
 
-func (s *Server) join(claims auth.Claims, conn *websocket.Conn) (*peer, error) {
+func (s *Server) join(claims auth.Claims, hello clientHello, conn *websocket.Conn) (*peer, error) {
 	if s.tokenRevoked(claims) {
 		return nil, errors.New("media token was revoked")
 	}
@@ -948,37 +1113,50 @@ func (s *Server) join(claims auth.Claims, conn *websocket.Conn) (*peer, error) {
 		id: claims.ParticipantID, claims: claims, pc: pc, ws: conn,
 		receiveSources: make(map[*webrtc.RTPReceiver]string),
 		// Block microphone RTP until the client reports its initial media state.
-		state: mediaState{MicMuted: true, MicTransmitting: false},
+		state:        mediaState{MicMuted: true, MicTransmitting: false},
+		publisher:    hello.publish,
+		publishReady: !hello.publish,
+		simulcast:    hello.simulcast,
 	}
 
-	for _, input := range []struct {
-		kind   webrtc.RTPCodecType
-		source string
-	}{
-		{kind: webrtc.RTPCodecTypeAudio, source: "microphone"},
-		{kind: webrtc.RTPCodecTypeVideo, source: "camera"},
-		{kind: webrtc.RTPCodecTypeVideo, source: "screen"},
-		// The screen's own sound travels on its own slot rather than mixed into
-		// the microphone: mute must silence the voice without silencing what is
-		// being shown, and the publisher's noise suppression must never touch it.
-		// This slot is deliberately LAST. The client answers the offer built from
-		// this list and picks its publish slots by m-line order, so appending
-		// keeps clients that predate the slot working against a newer server.
-		{kind: webrtc.RTPCodecTypeAudio, source: "screenAudio"},
-	} {
-		transceiver, err := pc.AddTransceiverFromKind(input.kind, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly})
-		if err != nil {
-			_ = pc.Close()
-			return nil, fmt.Errorf("add receiving transceiver: %w", err)
+	if !hello.publish {
+		for _, input := range []struct {
+			kind   webrtc.RTPCodecType
+			source string
+		}{
+			{kind: webrtc.RTPCodecTypeAudio, source: "microphone"},
+			{kind: webrtc.RTPCodecTypeVideo, source: "camera"},
+			{kind: webrtc.RTPCodecTypeVideo, source: "screen"},
+			// The screen's own sound travels on its own slot rather than mixed into
+			// the microphone: mute must silence the voice without silencing what is
+			// being shown, and the publisher's noise suppression must never touch it.
+			// This slot is deliberately LAST. The client answers the offer built from
+			// this list and picks its publish slots by m-line order, so appending
+			// keeps clients that predate the slot working against a newer server.
+			{kind: webrtc.RTPCodecTypeAudio, source: "screenAudio"},
+		} {
+			transceiver, err := pc.AddTransceiverFromKind(input.kind, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly})
+			if err != nil {
+				_ = pc.Close()
+				return nil, fmt.Errorf("add receiving transceiver: %w", err)
+			}
+			currentPeer.receiveSources[transceiver.Receiver()] = input.source
 		}
-		currentPeer.receiveSources[transceiver.Receiver()] = input.source
 	}
 
 	s.mu.Lock()
 	currentRoom := s.rooms[claims.Room]
 	if currentRoom == nil {
+		layers := make([]layerLimit, 0, len(s.cfg.SimulcastLayers))
+		for _, layer := range s.cfg.SimulcastLayers {
+			layers = append(layers, layerLimit{rid: layer.RID, bitrate: layer.Bitrate})
+		}
+		if len(layers) == 0 {
+			layers = defaultLayerLimits()
+		}
 		currentRoom = &room{
 			id: claims.Room, maxPeers: s.cfg.MaxPeersPerRoom,
+			simulcast: s.cfg.Simulcast, layers: layers,
 			peers:   make(map[string]*peer),
 			uplinks: make(map[string]localTrack), tracks: make(map[string]localTrack),
 			subscriptions: make(map[string]map[string]*subscriberSink),
@@ -1038,7 +1216,9 @@ func (s *Server) join(claims auth.Claims, conn *websocket.Conn) (*peer, error) {
 		// forward blocks for the lifetime of the track; recovering here keeps a
 		// malformed RTP path from killing every other call.
 		defer guardPanic("on-track")
+		currentPeer.receiveMu.RLock()
 		source := currentPeer.receiveSources[receiver]
+		currentPeer.receiveMu.RUnlock()
 		if source == "" {
 			slog.Warn("received track on unknown transceiver", "room", claims.Room, "peer", claims.ParticipantID)
 			return
@@ -1070,6 +1250,10 @@ func (s *Server) leave(roomID, peerID string) {
 }
 
 func (r *room) forward(owner *peer, remote *webrtc.TrackRemote, source string) {
+	if r.simulcast && owner.simulcast && remote.RID() != "" && (source == "camera" || source == "screen") {
+		r.forwardLayer(owner, remote, source)
+		return
+	}
 	// The track id is carried in SDP to subscribers. Keeping owner and source in
 	// it lets the browser associate an arriving RTP track with the authenticated
 	// participant snapshot without inventing a second track-signaling protocol.
@@ -1142,6 +1326,102 @@ func (r *room) forward(owner *peer, remote *webrtc.TrackRemote, source string) {
 		// Fan-out is per-subscriber: a blocked transport drains its own queue and
 		// loses packets, never the publisher's read loop.
 		r.broadcast(trackID, data)
+	}
+}
+
+// forwardLayer reads one RID encoding of a logical video track. Several of
+// these loops run for one publisher (q/h/f); they all feed the same localTrack,
+// and each subscriber picks the layer it forwards.
+func (r *room) forwardLayer(owner *peer, remote *webrtc.TrackRemote, source string) {
+	rid := remote.RID()
+	ssrc := remote.SSRC()
+
+	r.mu.Lock()
+	trackID := ""
+	candidate := localTrack{}
+	found := false
+	for id, existing := range r.uplinks {
+		if existing.ownerID == owner.id && existing.source == source && existing.simulcast != nil {
+			trackID, candidate, found = id, existing, true
+			break
+		}
+	}
+	if !found {
+		// A RID-less uplink for the same source is stale as soon as a layer
+		// arrives: the publisher now negotiates simulcast.
+		for id, existing := range r.uplinks {
+			if existing.ownerID == owner.id && existing.source == source && existing.simulcast == nil {
+				delete(r.uplinks, id)
+				delete(r.tracks, id)
+			}
+		}
+		trackID = fmt.Sprintf("%s:%s:%d", owner.id, source, ssrc)
+		local, err := webrtc.NewTrackLocalStaticRTP(remote.Codec().RTPCodecCapability, trackID, owner.id)
+		if err != nil {
+			r.mu.Unlock()
+			slog.Error("create local simulcast RTP track", "error", err)
+			return
+		}
+		activity := &trackActivity{}
+		candidate = localTrack{
+			ownerID: owner.id, source: source, track: local,
+			owner: owner, ssrc: ssrc, activity: activity,
+		}
+		candidate.simulcast = newSimulcastSource(owner, source, remote.Codec().MimeType, activity)
+		r.uplinks[trackID] = candidate
+		if owner.sourceActive(source) {
+			r.tracks[trackID] = candidate
+		}
+	}
+	activity := candidate.activity
+	sourceTrack := candidate.simulcast
+	sourceTrack.addLayer(rid, ssrc, remote)
+	r.mu.Unlock()
+	if !found {
+		r.sync()
+	}
+	defer func() {
+		r.mu.Lock()
+		empty := sourceTrack.removeLayer(rid, ssrc)
+		if current, ok := r.uplinks[trackID]; ok && current.simulcast == sourceTrack {
+			if empty {
+				delete(r.uplinks, trackID)
+				delete(r.tracks, trackID)
+			}
+		}
+		r.mu.Unlock()
+		// A disappearing encoding can be the one a subscriber was watching;
+		// sync lets its selector settle on another without waiting for SDP.
+		r.sync()
+	}()
+
+	for {
+		packet, _, err := remote.ReadRTP()
+		if err != nil {
+			return
+		}
+		activity.lastPacket.Store(time.Now().UnixNano())
+		if !owner.allowsPacketForwarding(source) {
+			continue
+		}
+		if r.metrics != nil {
+			r.metrics.forwardedPackets.Add(1)
+			r.metrics.forwardedBytes.Add(uint64(packet.MarshalSize()))
+		}
+		r.broadcastLayer(trackID, rid, packet)
+	}
+}
+
+func (r *room) broadcastLayer(trackID, rid string, packet *rtp.Packet) {
+	r.mu.Lock()
+	byTrack := r.subscriptions[trackID]
+	sinks := make([]*subscriberSink, 0, len(byTrack))
+	for _, sink := range byTrack {
+		sinks = append(sinks, sink)
+	}
+	r.mu.Unlock()
+	for _, sink := range sinks {
+		sink.pushLayer(rid, packet)
 	}
 }
 
@@ -1224,6 +1504,17 @@ func (r *room) ensureSink(currentPeer *peer, candidate localTrack) (*subscriberS
 		queue: make(chan []byte, queueSize), done: make(chan struct{}),
 		upstream: candidate, video: video, metrics: r.metrics,
 	}
+	if video && candidate.simulcast != nil {
+		limits := r.layers
+		if len(limits) == 0 {
+			limits = defaultLayerLimits()
+		}
+		sink.selector = newLayerSelector(limits, candidate.simulcast.layerRIDs(), "h", time.Now())
+		// Stable per-subscriber SSRC, sequence and timestamp across layer
+		// switches. The sender's own binding also fixes an SSRC, but sequence
+		// and timestamp continuity are ours to maintain.
+		sink.rewriter = newRTPRewriter(randomOutSSRC())
+	}
 
 	r.mu.Lock()
 	if byTrack := r.subscriptions[trackID]; byTrack != nil {
@@ -1282,6 +1573,13 @@ func (r *room) syncPeer(currentPeer *peer, available map[string]localTrack) erro
 		currentPeer.syncDirty = true
 		return nil
 	}
+	if !currentPeer.publishReady {
+		// The publisher's own offer/answer is still being negotiated. Starting a
+		// downstream offer now would cross it (glare); the publish handler syncs
+		// once its answer is on the wire.
+		currentPeer.syncDirty = true
+		return nil
+	}
 
 	changed := false
 	existing := make(map[string]bool)
@@ -1315,7 +1613,7 @@ func (r *room) syncPeer(currentPeer *peer, available map[string]localTrack) erro
 		}
 		go func() {
 			defer guardPanic("subscriber-rtcp")
-			readSubscriberRTCP(sender, candidate, r.metrics)
+			readSubscriberRTCP(sender, sink, r.metrics)
 		}()
 		if candidate.keyFrames != nil {
 			currentPeer.pendingKeyFrames = append(currentPeer.pendingKeyFrames, candidate)
@@ -1323,6 +1621,11 @@ func (r *room) syncPeer(currentPeer *peer, available map[string]localTrack) erro
 		changed = true
 	}
 	if currentPeer.offered && !changed {
+		return nil
+	}
+	if !currentPeer.offered && !changed && currentPeer.publisher {
+		// The publish handshake already established this transport. An empty
+		// downstream offer would negotiate no media and only risk a glare.
 		return nil
 	}
 
@@ -1483,6 +1786,8 @@ func (r *room) close() {
 
 func (p *peer) handleSignal(message signalMessage) error {
 	switch message.Event {
+	case "publish_offer":
+		return p.handlePublishOffer(message.Data)
 	case "answer":
 		answer := webrtc.SessionDescription{}
 		if err := json.Unmarshal(message.Data, &answer); err != nil {
@@ -1564,6 +1869,124 @@ func (p *peer) handleSignal(message signalMessage) error {
 		return nil
 	default:
 		return fmt.Errorf("unsupported signaling event %q", message.Event)
+	}
+}
+
+// handlePublishOffer applies the publisher's own offer and answers it only
+// after ICE gathering, so the client never has to wait for a second round of
+// trickled candidates to complete the transport. The answer completes the
+// publish handshake; only then may the room offer downstream tracks.
+func (p *peer) handlePublishOffer(data json.RawMessage) error {
+	offer := publishOfferData{}
+	if err := json.Unmarshal(data, &offer); err != nil {
+		return errors.New("invalid publish offer")
+	}
+	if offer.SDP.Type != webrtc.SDPTypeOffer || offer.SDP.SDP == "" {
+		return errors.New("publish offer must be a WebRTC offer")
+	}
+	if len(offer.MidToSource) == 0 {
+		return errors.New("publish offer must map at least one media slot")
+	}
+	if !p.publisher {
+		return errors.New("publish offer requires publish negotiation")
+	}
+
+	p.signalMu.Lock()
+	if p.pc.SignalingState() != webrtc.SignalingStateStable {
+		p.signalMu.Unlock()
+		return errors.New("publish offer arrived while another negotiation is in flight")
+	}
+	if err := p.pc.SetRemoteDescription(offer.SDP); err != nil {
+		p.signalMu.Unlock()
+		return fmt.Errorf("apply publish offer: %w", err)
+	}
+
+	transceivers := make(map[string]*webrtc.RTPTransceiver, len(p.pc.GetTransceivers()))
+	for _, transceiver := range p.pc.GetTransceivers() {
+		if mid := transceiver.Mid(); mid != "" {
+			transceivers[mid] = transceiver
+		}
+	}
+	sources := make(map[*webrtc.RTPReceiver]string, len(offer.MidToSource))
+	used := make(map[string]bool, len(offer.MidToSource))
+	for mid, source := range offer.MidToSource {
+		transceiver := transceivers[mid]
+		if transceiver == nil {
+			p.signalMu.Unlock()
+			return fmt.Errorf("publish offer maps unknown mid %q", mid)
+		}
+		receiver := transceiver.Receiver()
+		if receiver == nil {
+			p.signalMu.Unlock()
+			return fmt.Errorf("publish offer maps a mid without a receiver: %q", mid)
+		}
+		kind, known := publishSourceKind(source)
+		if !known {
+			p.signalMu.Unlock()
+			return fmt.Errorf("unknown publish source %q", source)
+		}
+		if used[source] {
+			p.signalMu.Unlock()
+			return fmt.Errorf("publish source %q is mapped twice", source)
+		}
+		if track := receiver.Track(); track != nil && track.Kind() != kind {
+			p.signalMu.Unlock()
+			return fmt.Errorf("publish source %q does not match its m-line kind", source)
+		}
+		used[source] = true
+		sources[receiver] = source
+	}
+	p.receiveMu.Lock()
+	p.receiveSources = sources
+	p.receiveMu.Unlock()
+
+	// Candidates that arrived before this offer were queued; the remote
+	// description is the first moment they can be applied. A single stale
+	// candidate must not fail the handshake, the next one will arrive.
+	for _, candidate := range p.pendingRemoteCandidates {
+		_ = p.pc.AddICECandidate(candidate)
+	}
+	p.pendingRemoteCandidates = nil
+
+	answer, err := p.pc.CreateAnswer(nil)
+	if err != nil {
+		p.signalMu.Unlock()
+		return fmt.Errorf("create publish answer: %w", err)
+	}
+	gathered := webrtc.GatheringCompletePromise(p.pc)
+	if err := p.pc.SetLocalDescription(answer); err != nil {
+		p.signalMu.Unlock()
+		return fmt.Errorf("apply publish answer: %w", err)
+	}
+	// The answer is sent as one complete SDP with every gathered candidate.
+	// This is required by the spike: a trickled answer raced the client's own
+	// offer and left the transport without a usable candidate pair.
+	<-gathered
+	local := p.pc.LocalDescription()
+	if local == nil {
+		p.signalMu.Unlock()
+		return errors.New("publish answer was not created")
+	}
+	p.publishReady = true
+	err = p.write("publish_answer", local)
+	p.signalMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("send publish answer: %w", err)
+	}
+	// Downstream offers may start now. The room may already have tracks from
+	// other publishers; the subscriber side of this peer is negotiated as usual.
+	p.room.sync()
+	return nil
+}
+
+func publishSourceKind(source string) (webrtc.RTPCodecType, bool) {
+	switch source {
+	case "microphone", "screenAudio":
+		return webrtc.RTPCodecTypeAudio, true
+	case "camera", "screen":
+		return webrtc.RTPCodecTypeVideo, true
+	default:
+		return 0, false
 	}
 }
 
@@ -1781,9 +2204,9 @@ func (p *peer) allowSignal() bool {
 // readSubscriberRTCP consumes the RTCP a subscriber sends back about one forwarded
 // track. Everything the interceptors already handle (receiver reports, NACK) is
 // dropped here; a key frame request is the one thing only the publisher can answer,
-// so it is passed upstream. Reading must continue regardless: an unread stream
-// eventually stalls the sender.
-func readSubscriberRTCP(sender *webrtc.RTPSender, upstream localTrack, metrics *serverMetrics) {
+// so it is passed upstream. REMB is the bandwidth evidence for layer selection.
+// Reading must continue regardless: an unread stream eventually stalls the sender.
+func readSubscriberRTCP(sender *webrtc.RTPSender, sink *subscriberSink, metrics *serverMetrics) {
 	// 1500 bytes was too small for a compound RTCP packet from a subscriber in a
 	// busy room: Read then returned a short-buffer error, this reader exited, and
 	// PLI/FIR never reached the publisher again until the next renegotiation.
@@ -1793,15 +2216,17 @@ func readSubscriberRTCP(sender *webrtc.RTPSender, upstream localTrack, metrics *
 		if err != nil {
 			return
 		}
-		if upstream.keyFrames == nil {
-			continue
-		}
 		packets, err := rtcp.Unmarshal(buffer[:n])
 		if err != nil {
 			continue
 		}
-		if requestsKeyFrame(packets) {
-			upstream.requestKeyFrame(metrics)
+		for _, packet := range packets {
+			if remb, ok := packet.(*rtcp.ReceiverEstimatedMaximumBitrate); ok && sink.selector != nil && remb.Bitrate > 0 {
+				sink.selector.setREMB(uint32(remb.Bitrate))
+			}
+		}
+		if sink.video && requestsKeyFrame(packets) {
+			sink.requestKeyFrame(metrics)
 		}
 	}
 }

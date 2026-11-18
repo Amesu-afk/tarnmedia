@@ -22,6 +22,9 @@ type Config struct {
 	PublicIP        string
 	UDPMin          uint16
 	UDPMax          uint16
+	// Один UDP-порт, который слушает ICE-мультиплексор: все PeerConnection
+	// делят его, поэтому потолок в ~100 пиров из диапазона порогов снят.
+	UDPPort         uint16
 	ICEURLs         []string
 	ICEUsername     string
 	ICECredential   string
@@ -107,6 +110,17 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("TARNMEDIA_UDP_MIN must not exceed TARNMEDIA_UDP_MAX")
 	}
 	cfg.UDPMin, cfg.UDPMax = min, max
+	port, err := envUint16("TARNMEDIA_UDP_PORT", min)
+	if err != nil {
+		return Config{}, err
+	}
+	if port == 0 {
+		return Config{}, fmt.Errorf("TARNMEDIA_UDP_PORT must be between 1 and 65535")
+	}
+	if port < min || port > max {
+		return Config{}, fmt.Errorf("TARNMEDIA_UDP_PORT must be inside TARNMEDIA_UDP_MIN..TARNMEDIA_UDP_MAX")
+	}
+	cfg.UDPPort = port
 
 	// The default covers local development only. Every deployment is expected to
 	// pass its own public origins through TARNMEDIA_ALLOWED_ORIGINS.

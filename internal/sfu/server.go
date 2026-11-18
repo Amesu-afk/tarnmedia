@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
@@ -96,6 +97,8 @@ type Server struct {
 	cfg      config.Config
 	api      *webrtc.API
 	pcConfig webrtc.Configuration
+	// Один UDP-порт на весь процесс: ICE-мультиплексор разбирает пакеты по ufrag.
+	udpMux   ice.UDPMux
 	authHTTP *http.Client
 	upgrader websocket.Upgrader
 
@@ -271,9 +274,15 @@ func New(cfg config.Config) (*Server, error) {
 		return nil, fmt.Errorf("register WebRTC interceptors: %w", err)
 	}
 	settings := webrtc.SettingEngine{}
-	if err := settings.SetEphemeralUDPPortRange(cfg.UDPMin, cfg.UDPMax); err != nil {
-		return nil, fmt.Errorf("configure UDP port range: %w", err)
+	// Все PeerConnection делят один UDP-порт. Раньше каждый занимал порт из
+	// диапазона в 100 штук, и исчерпание диапазона ломало вход новым участникам
+	// во ВСЕХ комнатах. Порт 0 (в тестах) означает «выбери свободный».
+	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: int(cfg.UDPPort)})
+	if err != nil {
+		return nil, fmt.Errorf("listen UDP mux on port %d: %w", cfg.UDPPort, err)
 	}
+	udpMux := ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: udpConn})
+	settings.SetICEUDPMux(udpMux)
 	// The production media endpoint is IPv4-only, so gather only the UDP
 	// candidates that can be advertised through TARNMEDIA_PUBLIC_IP.
 	settings.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
@@ -297,6 +306,7 @@ func New(cfg config.Config) (*Server, error) {
 			webrtc.WithInterceptorRegistry(interceptors),
 			webrtc.WithSettingEngine(settings),
 		),
+		udpMux:      udpMux,
 		pcConfig:    pcConfig,
 		authHTTP:    &http.Client{Timeout: 2 * time.Second},
 		rooms:       make(map[string]*room),
@@ -370,6 +380,9 @@ func (s *Server) Close() {
 	s.mu.Unlock()
 	for _, current := range rooms {
 		current.close()
+	}
+	if s.udpMux != nil {
+		_ = s.udpMux.Close()
 	}
 }
 

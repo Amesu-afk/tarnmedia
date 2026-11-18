@@ -55,8 +55,9 @@ $env:TARNMEDIA_CONTROL_SECRET = 'другой-секрет-не-короче-32-
 go run ./cmd/tarnmedia
 ```
 
-Публичный обработчик HTTP/WebSocket слушает `:8088`, медиа идёт по UDP
-`42000-42100`, control API и `/metrics` — на `127.0.0.1:8089`. По умолчанию как
+Публичный обработчик HTTP/WebSocket слушает `:8088`, медиа идёт по одному UDP-порту
+(`42000` по умолчанию; все PeerConnection делят его через ICE-мультиплексор),
+control API и `/metrics` — на `127.0.0.1:8089`. По умолчанию как
 источники браузера принимаются только `http://localhost:5173` и
 `http://127.0.0.1:5173` — любое реальное развёртывание обязано задать свои.
 
@@ -92,7 +93,8 @@ docker run --network host \
 | `TARNMEDIA_AUTH_URL` | `http://127.0.0.1:3001/internal/tarnmedia/validate` | Ваш эндпоинт проверки сессии (см. ниже). Только HTTPS или HTTP на loopback. |
 | `TARNMEDIA_ALLOWED_ORIGINS` | локальные dev-адреса | Точный список «схема+хост» через запятую. |
 | `TARNMEDIA_PUBLIC_IP` | *(пусто)* | Адрес, который анонсировать в ICE-кандидатах за NAT. |
-| `TARNMEDIA_UDP_MIN` / `TARNMEDIA_UDP_MAX` | `42000` / `42100` | Диапазон UDP-портов для медиа. |
+| `TARNMEDIA_UDP_MIN` / `TARNMEDIA_UDP_MAX` | `42000` / `42100` | Совместимый диапазон; порт мультиплексора должен входить в него. |
+| `TARNMEDIA_UDP_PORT` | `42000` | Один UDP-порт медиа, общий для всех PeerConnection через ICE-мультиплексор. |
 | `TARNMEDIA_ICE_URLS` | *(пусто)* | Свои STUN/TURN через запятую. Сторонние серверы по умолчанию не используются. |
 | `TARNMEDIA_ICE_USERNAME` / `TARNMEDIA_ICE_CREDENTIAL` | *(пусто)* | Учётные данные к ним. |
 | `TARNMEDIA_MAX_PEERS_PER_ROOM` | `25` | Жёсткий потолок на комнату, 2–100. |

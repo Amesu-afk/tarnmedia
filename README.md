@@ -54,8 +54,9 @@ $env:TARNMEDIA_CONTROL_SECRET = 'another-random-secret-at-least-32-chars'
 go run ./cmd/tarnmedia
 ```
 
-The public HTTP/WebSocket handler listens on `:8088`, media uses UDP
-`42000-42100`, and the control API plus `/metrics` listen on `127.0.0.1:8089`.
+The public HTTP/WebSocket handler listens on `:8088`, media uses a single UDP
+port (`42000` by default; every PeerConnection shares it through an ICE mux),
+and the control API plus `/metrics` listen on `127.0.0.1:8089`.
 By default only `http://localhost:5173` and `http://127.0.0.1:5173` are accepted
 as browser origins — every real deployment must set its own.
 
@@ -91,7 +92,8 @@ supported path.
 | `TARNMEDIA_AUTH_URL` | `http://127.0.0.1:3001/internal/tarnmedia/validate` | Your session-validation endpoint (see below). Must be HTTPS or loopback HTTP. |
 | `TARNMEDIA_ALLOWED_ORIGINS` | local dev origins | Exact scheme+host allowlist, comma-separated. |
 | `TARNMEDIA_PUBLIC_IP` | *(empty)* | Address to advertise in ICE candidates when behind NAT. |
-| `TARNMEDIA_UDP_MIN` / `TARNMEDIA_UDP_MAX` | `42000` / `42100` | Media UDP port range. |
+| `TARNMEDIA_UDP_MIN` / `TARNMEDIA_UDP_MAX` | `42000` / `42100` | Compatibility range; the mux port must stay inside it. |
+| `TARNMEDIA_UDP_PORT` | `42000` | Single media UDP port shared by every PeerConnection through an ICE mux. |
 | `TARNMEDIA_ICE_URLS` | *(empty)* | Your own STUN/TURN endpoints, comma-separated. No third-party server is used by default. |
 | `TARNMEDIA_ICE_USERNAME` / `TARNMEDIA_ICE_CREDENTIAL` | *(empty)* | Credentials for the above. |
 | `TARNMEDIA_MAX_PEERS_PER_ROOM` | `25` | Hard cap per room, 2–100. |

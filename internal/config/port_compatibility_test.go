@@ -24,3 +24,33 @@ func TestDefaultMediaPortsAvoidDiscordSTUNProfiles(t *testing.T) {
 		t.Fatal("default media range must retain at least the existing 101-port capacity")
 	}
 }
+
+func TestUDPPortDefaultsToRangeStart(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("TARNMEDIA_JWT_SECRET", "test-jwt-secret-that-is-long-enough")
+	t.Setenv("TARNMEDIA_CONTROL_SECRET", "test-control-secret-that-is-long-enough")
+	t.Setenv("TARNMEDIA_UDP_MIN", "")
+	t.Setenv("TARNMEDIA_UDP_MAX", "")
+	t.Setenv("TARNMEDIA_UDP_PORT", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UDPPort != cfg.UDPMin {
+		t.Fatalf("default mux port %d must be the range start %d", cfg.UDPPort, cfg.UDPMin)
+	}
+}
+
+func TestUDPPortMustStayInsideRange(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("TARNMEDIA_JWT_SECRET", "test-jwt-secret-that-is-long-enough")
+	t.Setenv("TARNMEDIA_CONTROL_SECRET", "test-control-secret-that-is-long-enough")
+	t.Setenv("TARNMEDIA_UDP_MIN", "42000")
+	t.Setenv("TARNMEDIA_UDP_MAX", "42100")
+	t.Setenv("TARNMEDIA_UDP_PORT", "43000")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("port outside the configured range must be rejected")
+	}
+}

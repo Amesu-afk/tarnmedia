@@ -1367,7 +1367,7 @@ func (r *room) forwardLayer(owner *peer, remote *webrtc.TrackRemote, source stri
 			ownerID: owner.id, source: source, track: local,
 			owner: owner, ssrc: ssrc, activity: activity,
 		}
-		candidate.simulcast = newSimulcastSource(owner, source, remote.Codec().MimeType, activity)
+		candidate.simulcast = newSimulcastSource(owner, remote.Codec().MimeType)
 		r.uplinks[trackID] = candidate
 		if owner.sourceActive(source) {
 			r.tracks[trackID] = candidate

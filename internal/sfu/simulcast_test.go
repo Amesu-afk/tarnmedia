@@ -21,7 +21,7 @@ func testLayerLimits() []layerLimit {
 }
 
 func TestSimulcastSourceGroupsRIDLayersUnderOneLogicalTrack(t *testing.T) {
-	source := newSimulcastSource(&peer{id: "pub"}, "camera", webrtc.MimeTypeVP8, &trackActivity{})
+	source := newSimulcastSource(&peer{id: "pub"}, webrtc.MimeTypeVP8)
 	source.addLayer("q", 10, nil)
 	source.addLayer("h", 20, nil)
 	source.addLayer("f", 30, nil)

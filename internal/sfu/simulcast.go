@@ -63,11 +63,8 @@ type simulcastLayer struct {
 // simulcastSource is one logical video track fed by several RID layers.
 // Subscribers see one TrackLocalStaticRTP per source, never per layer.
 type simulcastSource struct {
-	ownerID  string
-	source   string
 	mimeType string
 	owner    *peer
-	activity *trackActivity
 	// version changes whenever the set of RIDs changes, so a per-packet path can
 	// refresh subscriber availability without allocating a slice every packet.
 	version atomic.Uint64
@@ -75,10 +72,10 @@ type simulcastSource struct {
 	layers  map[string]*simulcastLayer
 }
 
-func newSimulcastSource(owner *peer, source, mimeType string, activity *trackActivity) *simulcastSource {
+func newSimulcastSource(owner *peer, mimeType string) *simulcastSource {
 	return &simulcastSource{
-		ownerID: owner.id, source: source, mimeType: mimeType,
-		owner: owner, activity: activity, layers: make(map[string]*simulcastLayer),
+		mimeType: mimeType, owner: owner,
+		layers: make(map[string]*simulcastLayer),
 	}
 }
 

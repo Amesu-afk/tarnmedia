@@ -16,8 +16,8 @@ import (
 // budget the layer needs on a subscriber's link; the layer selector uses it to
 // choose the highest layer that fits.
 type SimulcastLayer struct {
-	RID     string
-	Bitrate uint32
+	RID     string `json:"rid"`
+	Bitrate uint32 `json:"bitrate"`
 }
 
 type Config struct {

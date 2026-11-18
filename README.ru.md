@@ -107,7 +107,7 @@ docker run --network host \
 | `TARNMEDIA_ICE_USERNAME` / `TARNMEDIA_ICE_CREDENTIAL` | *(пусто)* | Учётные данные к ним. |
 | `TARNMEDIA_MAX_PEERS_PER_ROOM` | `25` | Жёсткий потолок на комнату, 2–100. |
 | `TARNMEDIA_SIMULCAST` | `on` | RID-simulcast и выбор слоя. `off` оставляет прежний путь с одним слоем и offer от сервера. |
-| `TARNMEDIA_SIMULCAST_LAYERS` | `q=150000,h=400000,f=1200000` | Бюджеты слоёв в бит/с, общие с клиентом. Порядок выводится из битрейта. |
+| `TARNMEDIA_SIMULCAST_LAYERS` | `q=150000,h=400000,f=1200000` | Бюджеты слоёв в бит/с; сервер передаёт их клиенту в `authenticated`. Порядок выводится из битрейта. |
 
 ## Интеграция с вашим приложением
 

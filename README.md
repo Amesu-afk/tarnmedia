@@ -106,7 +106,7 @@ supported path.
 | `TARNMEDIA_ICE_USERNAME` / `TARNMEDIA_ICE_CREDENTIAL` | *(empty)* | Credentials for the above. |
 | `TARNMEDIA_MAX_PEERS_PER_ROOM` | `25` | Hard cap per room, 2–100. |
 | `TARNMEDIA_SIMULCAST` | `on` | RID simulcast and layer selection. `off` keeps the legacy single-layer server-offer path. |
-| `TARNMEDIA_SIMULCAST_LAYERS` | `q=150000,h=400000,f=1200000` | Layer budgets in bit/s, shared with the client. Order is derived from the bitrate. |
+| `TARNMEDIA_SIMULCAST_LAYERS` | `q=150000,h=400000,f=1200000` | Layer budgets in bit/s, sent to the client in `authenticated`. Order is derived from the bitrate. |
 
 ## Integrating your application
 

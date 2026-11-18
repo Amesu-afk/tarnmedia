@@ -158,14 +158,18 @@ func TestPublishHandshakeAnswersAfterGatheringAndDefersDownstreamOffers(t *testi
 
 	authenticated := signals.wait(t, "authenticated")
 	var hello struct {
-		Publish   bool `json:"publish"`
-		Simulcast bool `json:"simulcast"`
+		Publish         bool                    `json:"publish"`
+		Simulcast       bool                    `json:"simulcast"`
+		SimulcastLayers []config.SimulcastLayer `json:"simulcastLayers"`
 	}
 	if err := json.Unmarshal(authenticated.Data, &hello); err != nil {
 		t.Fatal(err)
 	}
 	if !hello.Publish || !hello.Simulcast {
 		t.Fatalf("authenticated capabilities = %+v, want publish and simulcast", hello)
+	}
+	if len(hello.SimulcastLayers) != 3 || hello.SimulcastLayers[0].RID != "q" || hello.SimulcastLayers[2].Bitrate != 1_200_000 {
+		t.Fatalf("authenticated layer budgets = %+v", hello.SimulcastLayers)
 	}
 	// The old protocol offered recvonly slots immediately. A publisher must not
 	// get that offer: it is the offerer for its media.

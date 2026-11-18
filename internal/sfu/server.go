@@ -985,6 +985,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		// it and keeps answering the server's recvonly offer.
 		"publish":   s.cfg.Simulcast,
 		"simulcast": s.cfg.Simulcast,
+		// Shared layer budgets: the client encodes at the same bitrates the
+		// selector will use, so TARNMEDIA_SIMULCAST_LAYERS cannot drift from
+		// the client's hardcoded defaults.
+		"simulcastLayers": s.cfg.SimulcastLayers,
 	})
 	currentPeer.room.broadcastParticipants()
 	// A publishing peer gets its downlink offer only after publish_answer; syncPeer

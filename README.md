@@ -13,12 +13,13 @@ It powers calls and voice rooms in [TarnVeil](https://tarnveil.ru) and is availa
 **Experimental.** It runs in production for one small deployment (rooms of up to
 25 participants) and has unit tests, but:
 
-- there is **no simulcast or SVC layer selection** — every subscriber receives the
-  publisher's single encoding, so a large room is as expensive as its worst link;
+- **simulcast is supported for camera and screen**, with per-subscriber layer
+  selection (`q`/`h`/`f`) driven by REMB and queue pressure. It is a first step,
+  not full congestion control: there is no TWCC-based bandwidth estimator, and a
+  subscriber starts on `h` and switches with a 2 s guard and a key-frame wait;
 - fan-out itself is isolated: each subscriber has a bounded queue and its own
   worker. A slow transport drops its own packets (video requests a key frame)
-  instead of blocking the publisher's loop for everyone, but there is no
-  bandwidth-estimation-driven bitrate control;
+  instead of blocking the publisher's loop for everyone;
 - there are **no sustained load tests**, and no published capacity numbers;
 - the API is not frozen and may change between commits;
 - there is one maintainer and no support commitment. See [SECURITY.md](SECURITY.md)
@@ -32,6 +33,8 @@ Self-hosted deployments require independent testing of room sizes, network condi
 - one Opus audio track plus camera and screen video inputs per participant;
 - forwarding of browser-negotiated standard codecs (Opus, VP8, H.264 and anything
   both endpoints support) without transcoding;
+- RID simulcast for camera and screen, grouped into one logical track per source
+  with a stable SSRC, sequence and timestamp for every subscriber;
 - trickle ICE, renegotiation, on-demand video key frame requests, exact `Origin`
   allowlisting;
 - a bounded UDP port range and optional public-IP configuration;
@@ -39,8 +42,8 @@ Self-hosted deployments require independent testing of room sizes, network condi
 - token revocation, signaling rate limits, WebSocket keepalives, and `/health`,
   `/ready` and Prometheus `/metrics` endpoints.
 
-It deliberately does **not** do recording, transcoding, SIP, simulcast selection,
-or persistence.
+It deliberately does **not** do recording, transcoding, SIP, SVC (VP9/AV1 spatial
+layers) or persistence.
 
 ## Quick start
 
@@ -101,6 +104,8 @@ supported path.
 | `TARNMEDIA_ICE_URLS` | *(empty)* | Your own STUN/TURN endpoints, comma-separated. No third-party server is used by default. |
 | `TARNMEDIA_ICE_USERNAME` / `TARNMEDIA_ICE_CREDENTIAL` | *(empty)* | Credentials for the above. |
 | `TARNMEDIA_MAX_PEERS_PER_ROOM` | `25` | Hard cap per room, 2–100. |
+| `TARNMEDIA_SIMULCAST` | `on` | RID simulcast and layer selection. `off` keeps the legacy single-layer server-offer path. |
+| `TARNMEDIA_SIMULCAST_LAYERS` | `q=150000,h=400000,f=1200000` | Layer budgets in bit/s, shared with the client. Order is derived from the bitrate. |
 
 ## Integrating your application
 

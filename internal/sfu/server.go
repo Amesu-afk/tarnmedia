@@ -20,6 +20,7 @@ import (
 	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/tarnveil/tarnmedia/internal/auth"
@@ -79,6 +80,9 @@ type serverMetrics struct {
 	forwardedPackets     atomic.Uint64
 	forwardedBytes       atomic.Uint64
 	forwardWriteFailures atomic.Uint64
+	// Packets dropped because a subscriber's bounded queue was full. This is the
+	// operational signal of a slow transport (per-subscriber backpressure).
+	subscriberDrops      atomic.Uint64
 	controlRequests      atomic.Uint64
 	controlAuthFailures  atomic.Uint64
 	evictedPeers         atomic.Uint64
@@ -174,6 +178,80 @@ type trackActivity struct {
 	stalled    atomic.Bool
 }
 
+// Per-subscriber queues are deliberately short. The queue exists to absorb a
+// scheduling hiccup, not to buffer seconds of video: a consumer that cannot keep
+// up should lose packets (and get a key frame) instead of adding latency.
+const (
+	subscriberVideoQueue = 32
+	subscriberAudioQueue = 16
+)
+
+// subscriberSink is one subscriber's private copy of a published track.
+// The publisher's read loop only enqueues an immutable packet slice; a dedicated
+// worker writes it to that subscriber's TrackLocalStaticRTP. A blocked or broken
+// transport therefore cannot delay packets for other subscribers.
+type subscriberSink struct {
+	room     *room
+	trackID  string
+	peerID   string
+	track    *webrtc.TrackLocalStaticRTP
+	queue    chan []byte
+	done     chan struct{}
+	closeOnce sync.Once
+	upstream localTrack
+	video    bool
+	metrics  *serverMetrics
+}
+
+func (s *subscriberSink) close() {
+	s.closeOnce.Do(func() { close(s.done) })
+}
+
+func (s *subscriberSink) push(data []byte) {
+	select {
+	case <-s.done:
+		return
+	default:
+	}
+	select {
+	case s.queue <- data:
+	case <-s.done:
+	default:
+		if s.metrics != nil {
+			s.metrics.subscriberDrops.Add(1)
+		}
+		// Video recovers from a key frame; request one at most as often as the
+		// key frame gate allows. Audio has no equivalent, so its queue is longer
+		// and a drop there is a genuinely overloaded consumer.
+		if s.video {
+			s.upstream.requestKeyFrame(s.metrics)
+		}
+	}
+}
+
+func (s *subscriberSink) run() {
+	defer guardPanic("subscriber-sink")
+	packet := &rtp.Packet{}
+	for {
+		select {
+		case <-s.done:
+			return
+		case data := <-s.queue:
+			if err := packet.Unmarshal(data); err != nil {
+				continue
+			}
+			if err := s.track.WriteRTP(packet); err != nil {
+				if !errors.Is(err, io.ErrClosedPipe) && s.metrics != nil {
+					s.metrics.forwardWriteFailures.Add(1)
+				}
+				s.close()
+				s.room.dropSink(s.trackID, s.peerID, s)
+				return
+			}
+		}
+	}
+}
+
 // keyFrameGate collapses key frame requests for one uplink into at most one per
 // keyFrameMinInterval.
 type keyFrameGate struct {
@@ -216,10 +294,11 @@ type room struct {
 	peers    map[string]*peer
 	uplinks  map[string]localTrack
 	tracks   map[string]localTrack
-	metrics  *serverMetrics
-	// Packets that reached none of the subscribers. Kept per room so a broken
-	// subscriber can be reported once instead of flooding the log.
-	forwardFailures atomic.Uint64
+	// trackID -> subscriber peerID -> private sink. Every subscriber gets its own
+	// TrackLocalStaticRTP and a bounded queue, so one slow transport cannot stall
+	// the publisher's read loop for everyone else.
+	subscriptions map[string]map[string]*subscriberSink
+	metrics       *serverMetrics
 }
 
 type peer struct {
@@ -424,6 +503,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	writeCounter(w, "tarnmedia_forwarded_packets_total", s.metrics.forwardedPackets.Load())
 	writeCounter(w, "tarnmedia_forwarded_bytes_total", s.metrics.forwardedBytes.Load())
 	writeCounter(w, "tarnmedia_forward_write_failures_total", s.metrics.forwardWriteFailures.Load())
+	writeCounter(w, "tarnmedia_subscriber_drops_total", s.metrics.subscriberDrops.Load())
 	writeCounter(w, "tarnmedia_control_requests_total", s.metrics.controlRequests.Load())
 	writeCounter(w, "tarnmedia_control_auth_failures_total", s.metrics.controlAuthFailures.Load())
 	writeCounter(w, "tarnmedia_evicted_peers_total", s.metrics.evictedPeers.Load())
@@ -901,7 +981,8 @@ func (s *Server) join(claims auth.Claims, conn *websocket.Conn) (*peer, error) {
 			id: claims.Room, maxPeers: s.cfg.MaxPeersPerRoom,
 			peers:   make(map[string]*peer),
 			uplinks: make(map[string]localTrack), tracks: make(map[string]localTrack),
-			metrics: &s.metrics,
+			subscriptions: make(map[string]map[string]*subscriberSink),
+			metrics:       &s.metrics,
 		}
 		s.rooms[claims.Room] = currentRoom
 	}
@@ -1050,34 +1131,115 @@ func (r *room) forward(owner *peer, remote *webrtc.TrackRemote, source string) {
 		}
 		packet.Extension = false
 		packet.Extensions = nil
+		data, err := packet.Marshal()
+		if err != nil {
+			continue
+		}
 		if r.metrics != nil {
 			r.metrics.forwardedPackets.Add(1)
-			r.metrics.forwardedBytes.Add(uint64(packet.MarshalSize()))
+			r.metrics.forwardedBytes.Add(uint64(len(data)))
 		}
-		if err := local.WriteRTP(packet); err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			// The error belongs to one subscriber (a closing transport, a sender
-			// that has not bound yet), never to the room. Returning here used to
-			// mute the publisher for everybody and force a room-wide
-			// renegotiation; draining the publisher is also required, otherwise
-			// its own RTP stream stalls.
-			r.noteForwardFailure(owner.id, source, err)
-		}
+		// Fan-out is per-subscriber: a blocked transport drains its own queue and
+		// loses packets, never the publisher's read loop.
+		r.broadcast(trackID, data)
 	}
 }
 
-// noteForwardFailure records a packet that failed for at least one subscriber.
-// Pion aggregates per-binding errors, so with several subscribers the failing one
-// is not identified here; the counter is both a metric and the log throttle,
-// because a permanently broken subscriber would otherwise produce hundreds of
-// identical lines per second.
-func (r *room) noteForwardFailure(ownerID, source string, err error) {
-	failures := r.forwardFailures.Add(1)
-	if r.metrics != nil {
-		r.metrics.forwardWriteFailures.Add(1)
+func (r *room) broadcast(trackID string, data []byte) {
+	r.mu.Lock()
+	byTrack := r.subscriptions[trackID]
+	sinks := make([]*subscriberSink, 0, len(byTrack))
+	for _, sink := range byTrack {
+		sinks = append(sinks, sink)
 	}
-	if failures == 1 || failures%500 == 0 {
-		slog.Warn("RTP write failed", "room", r.id, "publisher", ownerID, "source", source, "failures", failures, "error", err)
+	r.mu.Unlock()
+	for _, sink := range sinks {
+		sink.push(data)
 	}
+}
+
+func (r *room) dropSink(trackID, peerID string, expected *subscriberSink) {
+	var removed *subscriberSink
+	r.mu.Lock()
+	if byTrack := r.subscriptions[trackID]; byTrack != nil {
+		current := byTrack[peerID]
+		if current != nil && (expected == nil || expected == current) {
+			removed = current
+			delete(byTrack, peerID)
+			if len(byTrack) == 0 {
+				delete(r.subscriptions, trackID)
+			}
+		}
+	}
+	r.mu.Unlock()
+	if removed != nil {
+		removed.close()
+	}
+}
+
+// dropPeerSinks removes every subscription of one peer. The caller must not hold
+// r.mu.
+func (r *room) dropPeerSinks(peerID string) {
+	var sinks []*subscriberSink
+	r.mu.Lock()
+	for trackID, byTrack := range r.subscriptions {
+		if sink := byTrack[peerID]; sink != nil {
+			delete(byTrack, peerID)
+			sinks = append(sinks, sink)
+		}
+		if len(byTrack) == 0 {
+			delete(r.subscriptions, trackID)
+		}
+	}
+	r.mu.Unlock()
+	for _, sink := range sinks {
+		sink.close()
+	}
+}
+
+// ensureSink returns this subscriber's own track for a published source,
+// creating the track, queue and worker on first use.
+func (r *room) ensureSink(currentPeer *peer, candidate localTrack) (*subscriberSink, error) {
+	trackID := candidate.track.ID()
+	r.mu.Lock()
+	if byTrack := r.subscriptions[trackID]; byTrack != nil {
+		if existing := byTrack[currentPeer.id]; existing != nil {
+			r.mu.Unlock()
+			return existing, nil
+		}
+	}
+	r.mu.Unlock()
+
+	track, err := webrtc.NewTrackLocalStaticRTP(candidate.track.Codec(), trackID, candidate.track.StreamID())
+	if err != nil {
+		return nil, err
+	}
+	video := candidate.source == "camera" || candidate.source == "screen"
+	queueSize := subscriberAudioQueue
+	if video {
+		queueSize = subscriberVideoQueue
+	}
+	sink := &subscriberSink{
+		room: r, trackID: trackID, peerID: currentPeer.id, track: track,
+		queue: make(chan []byte, queueSize), done: make(chan struct{}),
+		upstream: candidate, video: video, metrics: r.metrics,
+	}
+
+	r.mu.Lock()
+	if byTrack := r.subscriptions[trackID]; byTrack != nil {
+		if existing := byTrack[currentPeer.id]; existing != nil {
+			r.mu.Unlock()
+			sink.close()
+			return existing, nil
+		}
+	} else {
+		r.subscriptions[trackID] = make(map[string]*subscriberSink)
+	}
+	r.subscriptions[trackID][currentPeer.id] = sink
+	r.mu.Unlock()
+
+	go sink.run()
+	return sink, nil
 }
 
 func (r *room) sync() {
@@ -1134,6 +1296,7 @@ func (r *room) syncPeer(currentPeer *peer, available map[string]localTrack) erro
 			if err := currentPeer.pc.RemoveTrack(sender); err != nil {
 				return err
 			}
+			r.dropSink(track.ID(), currentPeer.id, nil)
 			changed = true
 		}
 	}
@@ -1141,8 +1304,13 @@ func (r *room) syncPeer(currentPeer *peer, available map[string]localTrack) erro
 		if candidate.ownerID == currentPeer.id || existing[id] {
 			continue
 		}
-		sender, err := currentPeer.pc.AddTrack(candidate.track)
+		sink, err := r.ensureSink(currentPeer, candidate)
 		if err != nil {
+			return err
+		}
+		sender, err := currentPeer.pc.AddTrack(sink.track)
+		if err != nil {
+			r.dropSink(id, currentPeer.id, sink)
 			return err
 		}
 		go func() {
@@ -1195,6 +1363,16 @@ func (r *room) removePeer(peerID string) bool {
 	r.mu.Lock()
 	currentPeer := r.peers[peerID]
 	delete(r.peers, peerID)
+	var sinks []*subscriberSink
+	for trackID, byTrack := range r.subscriptions {
+		if sink := byTrack[peerID]; sink != nil {
+			delete(byTrack, peerID)
+			sinks = append(sinks, sink)
+		}
+		if len(byTrack) == 0 {
+			delete(r.subscriptions, trackID)
+		}
+	}
 	for id, track := range r.uplinks {
 		if track.ownerID == peerID {
 			delete(r.uplinks, id)
@@ -1207,6 +1385,9 @@ func (r *room) removePeer(peerID string) bool {
 	}
 	empty := len(r.peers) == 0
 	r.mu.Unlock()
+	for _, sink := range sinks {
+		sink.close()
+	}
 	if currentPeer != nil {
 		currentPeer.close()
 	}
@@ -1281,10 +1462,20 @@ func (r *room) close() {
 	for _, currentPeer := range r.peers {
 		peers = append(peers, currentPeer)
 	}
+	var sinks []*subscriberSink
+	for _, byTrack := range r.subscriptions {
+		for _, sink := range byTrack {
+			sinks = append(sinks, sink)
+		}
+	}
 	r.peers = make(map[string]*peer)
 	r.uplinks = make(map[string]localTrack)
 	r.tracks = make(map[string]localTrack)
+	r.subscriptions = make(map[string]map[string]*subscriberSink)
 	r.mu.Unlock()
+	for _, sink := range sinks {
+		sink.close()
+	}
 	for _, currentPeer := range peers {
 		currentPeer.close()
 	}

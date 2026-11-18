@@ -15,6 +15,10 @@ It powers calls and voice rooms in [TarnVeil](https://tarnveil.ru) and is availa
 
 - there is **no simulcast or SVC layer selection** — every subscriber receives the
   publisher's single encoding, so a large room is as expensive as its worst link;
+- fan-out itself is isolated: each subscriber has a bounded queue and its own
+  worker. A slow transport drops its own packets (video requests a key frame)
+  instead of blocking the publisher's loop for everyone, but there is no
+  bandwidth-estimation-driven bitrate control;
 - there are **no sustained load tests**, and no published capacity numbers;
 - the API is not frozen and may change between commits;
 - there is one maintainer and no support commitment. See [SECURITY.md](SECURITY.md)

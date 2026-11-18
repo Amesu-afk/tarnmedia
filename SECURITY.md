@@ -59,4 +59,6 @@ These are design gaps, not vulnerabilities, and are already documented:
   each peer and the SFU, and the SFU necessarily sees the plaintext RTP in order
   to forward it. An operator who controls the server can access call media. If
   your threat model excludes the server operator, TarnMedia is the wrong tool.
-- No simulcast/SVC and no load-tested capacity numbers.
+- No simulcast/SVC and no load-tested capacity numbers. Fan-out is isolated with
+  bounded per-subscriber queues, but there is no bandwidth-estimation-driven
+  congestion control.

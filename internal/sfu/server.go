@@ -1321,6 +1321,16 @@ func (s *Server) join(claims auth.Claims, hello clientHello, conn *websocket.Con
 	currentRoom.peers[currentPeer.id] = currentPeer
 	currentRoom.mu.Unlock()
 
+	// TOCTOU: ban/revocation can arrive between tokenRevoked above and this
+	// insertion. The control endpoint's room sweep may have already run and
+	// missed a peer that was not in the map yet, so re-check after publishing
+	// the peer. Any revocation that arrives later will now find it in the room.
+	if s.tokenRevoked(claims) {
+		s.leave(claims.Room, currentPeer.id)
+		_ = pc.Close()
+		return nil, errors.New("media token was revoked")
+	}
+
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		// Gathering and teardown both invoke this; a panic here must not stop
 		// the SFU for everyone else.

@@ -7,6 +7,9 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"sync/atomic"
+
+	"github.com/pion/interceptor"
+	"github.com/pion/rtp"
 )
 
 // This file is compiled only with `-tags simulcastloss`. It is deliberately
@@ -36,3 +39,29 @@ func testDropForwardedPacket() bool {
 	percent := testLossPercent.Load()
 	return percent > 0 && rand.IntN(100) < int(percent)
 }
+
+// lossInterceptor sits at the innermost position of the local-stream writer
+// chain: the transport-wide CC header and the GCC send history are applied by
+// outer interceptors first, then this one discards the packet instead of
+// handing it to DTLS. The subscriber therefore reports a real gap in TWCC and
+// receiver reports, while the estimator has a matching send record.
+type lossInterceptor struct {
+	interceptor.NoOp
+}
+
+func (i *lossInterceptor) BindLocalStream(_ *interceptor.StreamInfo, writer interceptor.RTPWriter) interceptor.RTPWriter {
+	return interceptor.RTPWriterFunc(func(header *rtp.Header, payload []byte, attributes interceptor.Attributes) (int, error) {
+		if testDropForwardedPacket() {
+			return header.MarshalSize() + len(payload), nil
+		}
+		return writer.Write(header, payload, attributes)
+	})
+}
+
+type lossFactory struct{}
+
+func (lossFactory) NewInterceptor(string) (interceptor.Interceptor, error) {
+	return &lossInterceptor{}, nil
+}
+
+func lossInterceptorFactory() interceptor.Factory { return lossFactory{} }

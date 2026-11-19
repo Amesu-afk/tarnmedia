@@ -260,9 +260,6 @@ func (s *subscriberSink) close() {
 }
 
 func (s *subscriberSink) push(data []byte) {
-	if testDropForwardedPacket() {
-		return
-	}
 	select {
 	case <-s.done:
 		return
@@ -376,11 +373,6 @@ func (s *subscriberSink) pushMarshaled(packet *rtp.Packet) {
 }
 
 func (s *subscriberSink) pushMarshaledBytes(data []byte) {
-	if testDropForwardedPacket() {
-		// Real loss, not a full queue: the subscriber reports it in an RR, and
-		// the selector reacts to that report.
-		return
-	}
 	select {
 	case <-s.done:
 		return
@@ -551,6 +543,9 @@ func New(cfg config.Config) (*Server, error) {
 		return nil, fmt.Errorf("register simulcast header extensions: %w", err)
 	}
 	interceptors := &interceptor.Registry{}
+	// Test-only (`-tags simulcastloss`): the loss interceptor must be the
+	// innermost local writer, so GCC records a send before the packet is lost.
+	interceptors.Add(lossInterceptorFactory())
 	if err := webrtc.RegisterDefaultInterceptors(mediaEngine, interceptors); err != nil {
 		return nil, fmt.Errorf("register WebRTC interceptors: %w", err)
 	}

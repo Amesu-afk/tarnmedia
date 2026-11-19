@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -175,65 +176,9 @@ func TestPublishHandshakeAnswersAfterGatheringAndDefersDownstreamOffers(t *testi
 	// get that offer: it is the offerer for its media.
 	signals.expectNoOffer(t, 200*time.Millisecond)
 
-	pc, err := webrtc.NewAPI().NewPeerConnection(webrtc.Configuration{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	pc, video, audio := newPionPublishPeer(t)
 	defer func() { _ = pc.Close() }()
-	// Pion expresses simulcast on the send side through one track per RID on a
-	// single sender. Chrome does the same with sendEncodings; both put
-	// a=simulcast:send and a=rid:<rid> send in the offer.
-	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}, "camera", "publisher",
-		webrtc.WithRTPStreamID("q"),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	video, err := pc.AddTransceiverFromTrack(videoTrack, webrtc.RTPTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionSendonly,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, rid := range []string{"h", "f"} {
-		extra, err := webrtc.NewTrackLocalStaticRTP(
-			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}, "camera", "publisher",
-			webrtc.WithRTPStreamID(rid),
-		)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := video.Sender().AddEncoding(extra); err != nil {
-			t.Fatal(err)
-		}
-	}
-	audio, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionSendonly,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	offer, err := pc.CreateOffer(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := pc.SetLocalDescription(offer); err != nil {
-		t.Fatal(err)
-	}
-	if video.Mid() == "" || audio.Mid() == "" {
-		t.Fatal("offer assigned no mids to the publish slots")
-	}
-	payload := publishOfferData{
-		SDP: *pc.LocalDescription(),
-		MidToSource: map[string]string{
-			video.Mid(): "camera",
-			audio.Mid(): "microphone",
-		},
-	}
-	if err := conn.WriteJSON(map[string]any{"event": "publish_offer", "data": payload}); err != nil {
-		t.Fatal(err)
-	}
+	sendPublishOffer(t, conn, pc, video, audio)
 
 	answerMessage := signals.wait(t, "publish_answer")
 	answer := webrtc.SessionDescription{}
@@ -261,6 +206,244 @@ func TestPublishHandshakeAnswersAfterGatheringAndDefersDownstreamOffers(t *testi
 	}
 	// There are no other publishers in the room, so no downstream offer follows.
 	signals.expectNoOffer(t, 200*time.Millisecond)
+}
+
+// newPionPublishPeer builds the offerer side of the publish handshake: one
+// audio slot and one video slot carrying q/h/f RIDs, as Chrome does.
+func newPionPublishPeer(t *testing.T) (*webrtc.PeerConnection, *webrtc.RTPTransceiver, *webrtc.RTPTransceiver) {
+	t.Helper()
+	pc, err := webrtc.NewAPI().NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}, "camera", "publisher",
+		webrtc.WithRTPStreamID("q"),
+	)
+	if err != nil {
+		_ = pc.Close()
+		t.Fatal(err)
+	}
+	video, err := pc.AddTransceiverFromTrack(videoTrack, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendonly,
+	})
+	if err != nil {
+		_ = pc.Close()
+		t.Fatal(err)
+	}
+	for _, rid := range []string{"h", "f"} {
+		extra, err := webrtc.NewTrackLocalStaticRTP(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}, "camera", "publisher",
+			webrtc.WithRTPStreamID(rid),
+		)
+		if err != nil {
+			_ = pc.Close()
+			t.Fatal(err)
+		}
+		if err := video.Sender().AddEncoding(extra); err != nil {
+			_ = pc.Close()
+			t.Fatal(err)
+		}
+	}
+	audio, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendonly,
+	})
+	if err != nil {
+		_ = pc.Close()
+		t.Fatal(err)
+	}
+	return pc, video, audio
+}
+
+// sendPublishOffer creates and sends an offer for the current slots.
+func sendPublishOffer(
+	t *testing.T,
+	writer interface{ WriteJSON(v any) error },
+	pc *webrtc.PeerConnection,
+	video, audio *webrtc.RTPTransceiver,
+) webrtc.SessionDescription {
+	t.Helper()
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pc.SetLocalDescription(offer); err != nil {
+		t.Fatal(err)
+	}
+	if video.Mid() == "" || audio.Mid() == "" {
+		t.Fatal("offer assigned no mids to the publish slots")
+	}
+	payload := publishOfferData{
+		SDP: *pc.LocalDescription(),
+		MidToSource: map[string]string{
+			video.Mid(): "camera",
+			audio.Mid(): "microphone",
+		},
+	}
+	if err := writer.WriteJSON(map[string]any{"event": "publish_offer", "data": payload}); err != nil {
+		t.Fatal(err)
+	}
+	return *pc.LocalDescription()
+}
+
+// serializedSignalConn keeps ICE trickle and test-driven signaling from writing
+// to the same websocket concurrently.
+type serializedSignalConn struct {
+	mu   sync.Mutex
+	conn *websocket.Conn
+}
+
+func (s *serializedSignalConn) WriteJSON(value any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn.WriteJSON(value)
+}
+
+// A publisher can collide with the SFU's own offer: an ICE restart enters the
+// transport while a repeat publish_offer is on the wire. The server must reject
+// the offer in a way the client can retry, and the retry must succeed after the
+// restart answer without losing the publishing handshake.
+func TestPublishOfferRetriesAfterIceRestartGlare(t *testing.T) {
+	server, wsURL, jwtSecret := newPublishTestServer(t, true)
+	rawConn, signals := dialPublishPeer(t, wsURL, jwtSecret, "publisher", true, true)
+	conn := &serializedSignalConn{conn: rawConn}
+	signals.wait(t, "authenticated")
+
+	pc, video, audio := newPionPublishPeer(t)
+	defer func() { _ = pc.Close() }()
+	connected := make(chan struct{})
+	var connectedOnce sync.Once
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		if state == webrtc.PeerConnectionStateConnected {
+			connectedOnce.Do(func() { close(connected) })
+		}
+	})
+	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate == nil {
+			return
+		}
+		_ = conn.WriteJSON(map[string]any{"event": "candidate", "data": candidate.ToJSON()})
+	})
+
+	firstOffer := sendPublishOffer(t, conn, pc, video, audio)
+	firstAnswerMessage := signals.wait(t, "publish_answer")
+	firstAnswer := webrtc.SessionDescription{}
+	if err := json.Unmarshal(firstAnswerMessage.Data, &firstAnswer); err != nil {
+		t.Fatal(err)
+	}
+	if err := pc.SetRemoteDescription(firstAnswer); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-connected:
+	case <-time.After(10 * time.Second):
+		t.Fatal("publisher did not connect after the publish handshake")
+	}
+
+	sp := waitServerPeer(t, server, "publish-room", "publisher")
+	waitServerSignalingState(t, sp, webrtc.SignalingStateStable)
+	before := sdpAttribute(firstAnswer.SDP, "ice-ufrag")
+
+	// The SFU reacts to a broken path on its own. Its offer is now in flight.
+	if err := sp.restartICE(); err != nil {
+		t.Fatalf("restart ICE: %v", err)
+	}
+	restartMessage := signals.wait(t, "offer")
+	restartOffer := webrtc.SessionDescription{}
+	if err := json.Unmarshal(restartMessage.Data, &restartOffer); err != nil {
+		t.Fatal(err)
+	}
+	if after := sdpAttribute(restartOffer.SDP, "ice-ufrag"); after == "" || after == before {
+		t.Fatalf("restart offer ufrag = %q, want a fresh one (was %q)", after, before)
+	}
+
+	// The repeat publish_offer crosses the restart offer. The client must get a
+	// retryable error instead of a silent deadlock.
+	if err := conn.WriteJSON(map[string]any{
+		"event": "publish_offer",
+		"data": publishOfferData{
+			SDP: firstOffer,
+			MidToSource: map[string]string{
+				video.Mid(): "camera",
+				audio.Mid(): "microphone",
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	errorMessage := signals.wait(t, "error")
+	var rejection struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(errorMessage.Data, &rejection); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rejection.Message, "negotiation is in flight") {
+		t.Fatalf("glare rejection = %q, want a retryable negotiation message", rejection.Message)
+	}
+
+	// Answer the ICE restart, exactly as the browser does.
+	if err := pc.SetRemoteDescription(restartOffer); err != nil {
+		t.Fatal(err)
+	}
+	restartAnswer, err := pc.CreateAnswer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pc.SetLocalDescription(restartAnswer); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteJSON(map[string]any{"event": "answer", "data": pc.LocalDescription()}); err != nil {
+		t.Fatal(err)
+	}
+	waitServerSignalingState(t, sp, webrtc.SignalingStateStable)
+
+	// The retried publish offer is now applied and answered.
+	sendPublishOffer(t, conn, pc, video, audio)
+	retryAnswerMessage := signals.wait(t, "publish_answer")
+	retryAnswer := webrtc.SessionDescription{}
+	if err := json.Unmarshal(retryAnswerMessage.Data, &retryAnswer); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(retryAnswer.SDP, "a=simulcast:recv") {
+		t.Fatalf("retried publish answer lost the RID layers:\n%s", retryAnswer.SDP)
+	}
+	if err := pc.SetRemoteDescription(retryAnswer); err != nil {
+		t.Fatal(err)
+	}
+	waitServerSignalingState(t, sp, webrtc.SignalingStateStable)
+	if !sp.publishReady {
+		t.Fatal("publisher is not marked ready after the retried publish answer")
+	}
+}
+
+// Old clients do not send publish:true, so a simulcast-enabled server must keep
+// the original recvonly offer path and keep their media flowing. This is the
+// "old client, new server" half of the compatibility check; the client test
+// suite covers "new client, old server".
+func TestLegacyClientStillGetsRecvonlySlotsFromSimulcastServer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), lifecycleSignalDeadline)
+	defer cancel()
+
+	server, wsURL, jwtSecret := newPublishTestServer(t, true)
+	subscriber := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "legacy-subscriber", "publish-room", false)
+	defer subscriber.close()
+	waitLifecycleConnected(t, ctx, subscriber)
+
+	publisher := newLifecyclePeer(t, ctx, wsURL, jwtSecret, "legacy-publisher", "publish-room", true)
+	defer publisher.close()
+	waitLifecycleConnected(t, ctx, publisher)
+	waitParticipantCount(t, ctx, subscriber, 2)
+	waitPacketCount(t, ctx, subscriber, "legacy-publisher", 5)
+
+	serverPeer := waitServerPeer(t, server, "publish-room", "legacy-publisher")
+	if serverPeer.publisher {
+		t.Fatal("legacy client was treated as a publish-offer client")
+	}
+	local := serverPeer.pc.LocalDescription()
+	if local == nil || !strings.Contains(local.SDP, "a=recvonly") {
+		t.Fatalf("server did not offer recvonly slots to a legacy client:\n%v", local)
+	}
 }
 
 func TestSimulcastOffKeepsTheOriginalServerOffer(t *testing.T) {

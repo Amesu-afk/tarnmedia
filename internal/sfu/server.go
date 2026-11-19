@@ -20,6 +20,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/pkg/twcc"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
@@ -107,6 +108,8 @@ type Server struct {
 	cfg      config.Config
 	api      *webrtc.API
 	pcConfig webrtc.Configuration
+	// bwe holds the per-PeerConnection Google Congestion Control estimators.
+	bwe *bweFactory
 	// Один UDP-порт на весь процесс: ICE-мультиплексор разбирает пакеты по ufrag.
 	udpMux   ice.UDPMux
 	authHTTP *http.Client
@@ -236,6 +239,11 @@ type subscriberSink struct {
 	selector  *layerSelector
 	rewriter  *rtpRewriter
 	rewriteMu sync.Mutex
+	// The subscriber whose transport this sink feeds; its BWE is shared by all
+	// video sinks and its videoSinks counter splits the budget.
+	subscriber   *peer
+	countedVideo bool
+	bweApplied   bool
 	// Last observed layer-set version and time, to avoid rebuilding availability
 	// per packet while still noticing a silently disabled encoding.
 	layersVersion uint64
@@ -243,7 +251,12 @@ type subscriberSink struct {
 }
 
 func (s *subscriberSink) close() {
-	s.closeOnce.Do(func() { close(s.done) })
+	s.closeOnce.Do(func() {
+		if s.countedVideo && s.subscriber != nil {
+			s.subscriber.videoSinks.Add(-1)
+		}
+		close(s.done)
+	})
 }
 
 func (s *subscriberSink) push(data []byte) {
@@ -301,6 +314,20 @@ func (s *subscriberSink) pushLayer(rid string, packet *rtp.Packet) {
 		s.layersVersion = version
 		s.layersChecked = now
 		s.selector.setAvailable(s.upstream.simulcast.layerRIDs())
+	}
+	if s.subscriber != nil && s.subscriber.bwe != nil {
+		if target, ok := s.subscriber.bwe.target(now); ok {
+			count := int(s.subscriber.videoSinks.Load())
+			if count < 1 {
+				count = 1
+			}
+			s.selector.setEstimate(target / uint32(count))
+			s.bweApplied = true
+		} else if s.bweApplied {
+			// TWCC stopped; the receiver-report path takes over again.
+			s.selector.setEstimate(0)
+			s.bweApplied = false
+		}
 	}
 	previousRID := s.selector.currentRID()
 	requestRID := ""
@@ -471,6 +498,12 @@ type peer struct {
 	// simulcast says the publisher asked for RID layers. A publish client that
 	// did not (Android WebView) is still accepted, just as a single layer.
 	simulcast bool
+	// bwe is this transport's downlink bandwidth estimate. It is shared by all
+	// sinks because TWCC feedback describes the whole transport.
+	bwe *bweState
+	// Number of simulcast video sinks for this subscriber, used to split the
+	// transport budget between a camera and a screen.
+	videoSinks atomic.Int32
 
 	writeMu  sync.Mutex
 	signalMu sync.Mutex
@@ -521,6 +554,17 @@ func New(cfg config.Config) (*Server, error) {
 	if err := webrtc.RegisterDefaultInterceptors(mediaEngine, interceptors); err != nil {
 		return nil, fmt.Errorf("register WebRTC interceptors: %w", err)
 	}
+	// Downlink congestion control: the estimator records outgoing streams and
+	// consumes the subscriber's transport-wide CC feedback. The header
+	// extension interceptor must be added after it so it wraps the estimator's
+	// writer and stamps the sequence number the feedback refers to.
+	bweFactory := newBWEFactory()
+	interceptors.Add(bweFactory)
+	headerExtension, err := twcc.NewHeaderExtensionInterceptor()
+	if err != nil {
+		return nil, fmt.Errorf("register transport-wide CC header extension: %w", err)
+	}
+	interceptors.Add(headerExtension)
 	settings := webrtc.SettingEngine{}
 	// Все PeerConnection делят один UDP-порт. Раньше каждый занимал порт из
 	// диапазона в 100 штук, и исчерпание диапазона ломало вход новым участникам
@@ -554,6 +598,7 @@ func New(cfg config.Config) (*Server, error) {
 			webrtc.WithInterceptorRegistry(interceptors),
 			webrtc.WithSettingEngine(settings),
 		),
+		bwe:         bweFactory,
 		udpMux:      udpMux,
 		pcConfig:    pcConfig,
 		authHTTP:    &http.Client{Timeout: 2 * time.Second},
@@ -696,6 +741,13 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	}
 	_, _ = fmt.Fprintf(w, "# TYPE tarnmedia_simulcast_waiting_keyframe gauge\ntarnmedia_simulcast_waiting_keyframe %d\n", waiting)
 	_, _ = fmt.Fprintf(w, "# TYPE tarnmedia_simulcast_wait_seconds gauge\ntarnmedia_simulcast_wait_seconds %.3f\n", maxWait.Seconds())
+	bweActive, bweTarget, twccFeedback := 0, uint32(0), uint64(0)
+	if s.bwe != nil {
+		bweActive, bweTarget, twccFeedback = s.bwe.snapshot(time.Now())
+	}
+	writeCounter(w, "tarnmedia_twcc_received_total", twccFeedback)
+	_, _ = fmt.Fprintf(w, "# TYPE tarnmedia_simulcast_bwe_active gauge\ntarnmedia_simulcast_bwe_active %d\n", bweActive)
+	_, _ = fmt.Fprintf(w, "# TYPE tarnmedia_simulcast_bwe_target_bps gauge\ntarnmedia_simulcast_bwe_target_bps %d\n", bweTarget)
 }
 
 func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
@@ -1196,6 +1248,10 @@ func (s *Server) join(claims auth.Claims, hello clientHello, conn *websocket.Con
 	if err != nil {
 		return nil, fmt.Errorf("create PeerConnection: %w", err)
 	}
+	var bwe *bweState
+	if s.bwe != nil {
+		bwe = s.bwe.state(pc.ID())
+	}
 	currentPeer := &peer{
 		id: claims.ParticipantID, claims: claims, pc: pc, ws: conn,
 		receiveSources: make(map[*webrtc.RTPReceiver]string),
@@ -1204,6 +1260,7 @@ func (s *Server) join(claims auth.Claims, hello clientHello, conn *websocket.Con
 		publisher:    hello.publish,
 		publishReady: !hello.publish,
 		simulcast:    hello.simulcast,
+		bwe:          bwe,
 	}
 
 	if !hello.publish {
@@ -1591,7 +1648,7 @@ func (r *room) ensureSink(currentPeer *peer, candidate localTrack) (*subscriberS
 	sink := &subscriberSink{
 		room: r, trackID: trackID, peerID: currentPeer.id, track: track,
 		queue: make(chan []byte, queueSize), done: make(chan struct{}),
-		upstream: candidate, video: video, metrics: r.metrics,
+		upstream: candidate, video: video, metrics: r.metrics, subscriber: currentPeer,
 	}
 	if video && candidate.simulcast != nil {
 		limits := r.layers
@@ -1617,6 +1674,10 @@ func (r *room) ensureSink(currentPeer *peer, candidate localTrack) (*subscriberS
 		r.subscriptions[trackID] = make(map[string]*subscriberSink)
 	}
 	r.subscriptions[trackID][currentPeer.id] = sink
+	if video && candidate.simulcast != nil {
+		sink.countedVideo = true
+		currentPeer.videoSinks.Add(1)
+	}
 	r.mu.Unlock()
 
 	go sink.run()

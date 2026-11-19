@@ -14,10 +14,10 @@ It powers calls and voice rooms in [TarnVeil](https://tarnveil.ru) and is availa
 25 participants) and has unit tests, but:
 
 - **simulcast is supported for camera and screen**, with per-subscriber layer
-  selection (`q`/`h`/`f`) driven by REMB when the browser sends it, otherwise by
-  receiver-report loss and queue pressure. It is a first step, not full
-  congestion control: there is no TWCC-based bandwidth estimator, and a
-  subscriber starts on `h` and switches with a 2 s guard and a key-frame wait;
+  selection (`q`/`h`/`f`). The budget comes from per-subscriber GCC (TWCC), with
+  REMB and receiver-report loss as fallbacks. It is not load-tested: there is no
+  server-side pacing or transcoding, and a subscriber starts on `h` and switches
+  with a 2 s guard and a key-frame wait;
 - fan-out itself is isolated: each subscriber has a bounded queue and its own
   worker. A slow transport drops its own packets (video requests a key frame)
   instead of blocking the publisher's loop for everyone;
@@ -36,6 +36,8 @@ Self-hosted deployments require independent testing of room sizes, network condi
   both endpoints support) without transcoding;
 - RID simulcast for camera and screen, grouped into one logical track per source
   with a stable SSRC, sequence and timestamp for every subscriber;
+- per-subscriber downlink bandwidth estimation from transport-wide CC feedback
+  (GCC), with REMB and receiver reports as fallbacks;
 - trickle ICE, renegotiation, on-demand video key frame requests, exact `Origin`
   allowlisting;
 - a bounded UDP port range and optional public-IP configuration;

@@ -350,6 +350,15 @@ func (s *layerSelector) setREMB(bits uint32) {
 	s.mu.Unlock()
 }
 
+// setEstimate feeds the transport-wide bandwidth estimate (GCC) into the same
+// budget the selector uses for REMB. Zero clears it and returns selection to
+// receiver reports and queue pressure.
+func (s *layerSelector) setEstimate(bits uint32) {
+	s.mu.Lock()
+	s.remb = bits
+	s.mu.Unlock()
+}
+
 // nextSwitch returns the layer a switch should move to, if one is due. The
 // caller requests a key frame and keeps forwarding the current layer until it
 // arrives.

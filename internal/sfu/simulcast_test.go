@@ -1,6 +1,7 @@
 package sfu
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
@@ -72,6 +74,113 @@ func TestSimulcastSourceExcludesSilentLayers(t *testing.T) {
 	source.layer("f").lastPacket.Store(time.Now().UnixNano())
 	if got := len(source.layerRIDs()); got != 3 {
 		t.Fatalf("active layers after resume = %d, want 3", got)
+	}
+}
+
+func TestSubscriberReportsDriveLayerSelection(t *testing.T) {
+	start := time.Now().Add(-3 * time.Second)
+
+	t.Run("loss degrades", func(t *testing.T) {
+		selector := newLayerSelector(testLayerLimits(), []string{"q", "h", "f"}, "f", start)
+		selector.accept("f", true, start)
+		sink := &subscriberSink{selector: selector, video: true}
+		metrics := &serverMetrics{}
+
+		packets, err := rtcp.Unmarshal(mustMarshalRTCP(t,
+			&rtcp.ReceiverReport{Reports: []rtcp.ReceptionReport{{SSRC: 42, FractionLost: 51}}}, // 20 %
+		))
+		if err != nil {
+			t.Fatal(err)
+		}
+		applySubscriberRTCP(packets, sink, metrics)
+
+		target, ok := selector.nextSwitch(time.Now())
+		if !ok || target != "h" {
+			t.Fatalf("target after 20%% loss = %q, ok = %t; want h", target, ok)
+		}
+	})
+
+	t.Run("remb degrades to budget", func(t *testing.T) {
+		selector := newLayerSelector(testLayerLimits(), []string{"q", "h", "f"}, "f", start)
+		selector.accept("f", true, start)
+		sink := &subscriberSink{selector: selector, video: true}
+		metrics := &serverMetrics{}
+
+		packets, err := rtcp.Unmarshal(mustMarshalRTCP(t,
+			&rtcp.ReceiverEstimatedMaximumBitrate{Bitrate: 300_000},
+		))
+		if err != nil {
+			t.Fatal(err)
+		}
+		applySubscriberRTCP(packets, sink, metrics)
+
+		if metrics.rembReceived.Load() != 1 {
+			t.Fatalf("REMB counter = %d, want 1", metrics.rembReceived.Load())
+		}
+		target, ok := selector.nextSwitch(time.Now())
+		if !ok || target != "q" {
+			t.Fatalf("target after 300 kbit/s REMB = %q, ok = %t; want q", target, ok)
+		}
+	})
+}
+
+func mustMarshalRTCP(t *testing.T, packets ...rtcp.Packet) []byte {
+	t.Helper()
+	raw, err := rtcp.Marshal(packets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func TestSimulcastMetricsExposeLayerAndKeyFrameWait(t *testing.T) {
+	now := time.Now()
+	selector := newLayerSelector(testLayerLimits(), []string{"q", "h", "f"}, "h", now)
+	selector.accept("h", true, now)
+	server := &Server{
+		rooms: map[string]*room{
+			"room": {
+				id: "room",
+				subscriptions: map[string]map[string]*subscriberSink{
+					"track": {"peer": {selector: selector}},
+				},
+			},
+		},
+	}
+	scrape := func() string {
+		recorder := httptest.NewRecorder()
+		server.handleMetrics(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		return recorder.Body.String()
+	}
+
+	body := scrape()
+	for _, want := range []string{
+		`tarnmedia_simulcast_layer{layer="h"} 1`,
+		`tarnmedia_simulcast_layer{layer="q"} 0`,
+		"tarnmedia_simulcast_waiting_keyframe 0",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, body)
+		}
+	}
+
+	selector.beginSwitch("f", now)
+	selector.mu.Lock()
+	selector.waitingSince = time.Now().Add(-2 * time.Second)
+	selector.mu.Unlock()
+	body = scrape()
+	if !strings.Contains(body, "tarnmedia_simulcast_waiting_keyframe 1") {
+		t.Fatalf("waiting gauge missing:\n%s", body)
+	}
+	waitLine := ""
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "tarnmedia_simulcast_wait_seconds ") {
+			waitLine = line
+		}
+	}
+	var seconds float64
+	if _, err := fmt.Sscanf(waitLine, "tarnmedia_simulcast_wait_seconds %f", &seconds); err != nil || seconds < 1.9 {
+		t.Fatalf("wait gauge = %q, want about 2 seconds", waitLine)
 	}
 }
 
@@ -204,48 +313,44 @@ func TestLayerSelectorFallsBackWhenTheCurrentLayerDisappears(t *testing.T) {
 	selector.accept("h", true, now)
 
 	selector.setAvailable([]string{"q", "f"})
-	target, ok := selector.nextSwitch(now)
+	fallbackAt := now.Add(simulcastPreferredWait + time.Millisecond)
+	target, ok := selector.nextSwitch(fallbackAt)
 	if !ok || target != "q" {
 		t.Fatalf("fallback = %q, ok = %t; want q", target, ok)
 	}
 	// Even a layer that vanished right after a switch is replaced without
 	// waiting for the guard: the current encoding is not producing packets.
-	if send, _ := selector.accept("q", true, now); !send {
+	if send, _ := selector.accept("q", true, fallbackAt); !send {
 		t.Fatal("q key frame must be forwarded after the fallback")
 	}
 }
 
 func TestLayerSelectorRampsFromEarlyLowLayerToStartLayer(t *testing.T) {
 	now := time.Unix(4500, 0)
-	// Chrome announced q first; h appears right after the subscriber joined.
+	// Only q is on the wire when the sink is created. The selector waits for h
+	// instead of forwarding q and switching up immediately.
 	selector := newLayerSelector(testLayerLimits(), []string{"q"}, "h", now)
-	if selector.current != "q" {
-		t.Fatalf("initial layer with only q available = %q, want q", selector.current)
+	if selector.current != "h" {
+		t.Fatalf("initial layer = %q, want h", selector.current)
+	}
+	if send, _ := selector.accept("q", true, now.Add(100*time.Millisecond)); send {
+		t.Fatal("q must not be forwarded while the preferred layer is pending")
 	}
 	selector.setAvailable([]string{"q", "h"})
-	target, ok := selector.nextSwitch(now.Add(100 * time.Millisecond))
-	if !ok || target != "h" {
-		t.Fatalf("initial ramp target = %q, ok = %t; want h", target, ok)
-	}
-	if send, switched := selector.accept("h", true, now.Add(150*time.Millisecond)); !send || !switched {
-		t.Fatal("h key frame must complete the initial ramp")
+	if send, switched := selector.accept("h", true, now.Add(150*time.Millisecond)); !send || switched {
+		t.Fatalf("h = %t/%t, want true/false", send, switched)
 	}
 }
 
-func TestLayerSelectorAlignsToStartLayerWhenProbesArriveOutOfOrder(t *testing.T) {
-	now := time.Unix(4600, 0)
-	// Pion may register f before h and q, so the sink starts on f.
-	selector := newLayerSelector(testLayerLimits(), []string{"f"}, "h", now)
-	if selector.current != "f" {
-		t.Fatalf("initial layer = %q, want f", selector.current)
+func TestLayerSelectorFallsBackWhenThePreferredLayerNeverArrives(t *testing.T) {
+	now := time.Unix(4550, 0)
+	selector := newLayerSelector(testLayerLimits(), []string{"q"}, "h", now)
+	if _, ok := selector.nextSwitch(now.Add(simulcastPreferredWait - time.Millisecond)); ok {
+		t.Fatal("the preferred layer wait expired too early")
 	}
-	selector.setAvailable([]string{"q", "h", "f"})
-	target, ok := selector.nextSwitch(now.Add(100 * time.Millisecond))
-	if !ok || target != "h" {
-		t.Fatalf("alignment target = %q, ok = %t; want h", target, ok)
-	}
-	if send, switched := selector.accept("h", true, now.Add(200*time.Millisecond)); !send || !switched {
-		t.Fatal("h key frame must complete the alignment")
+	target, ok := selector.nextSwitch(now.Add(simulcastPreferredWait + time.Millisecond))
+	if !ok || target != "q" {
+		t.Fatalf("fallback target = %q, ok = %t; want q", target, ok)
 	}
 }
 

@@ -27,9 +27,9 @@ const (
 	simulcastGrowAfter      = 8 * time.Second
 	// A fresh subscription may learn its RID set one encoding at a time: Pion
 	// probes SSRCs as packets arrive, so f can be registered before h and q.
-	// Within this window the selector aligns to the preferred start layer even
-	// if that means moving down from a probe-time upper layer.
-	simulcastInitialRampWindow = 2 * time.Second
+	// Wait briefly for the preferred layer instead of forwarding the probed one
+	// and switching down immediately after.
+	simulcastPreferredWait = 500 * time.Millisecond
 	// Fraction of the reported REMB a layer may use. The rest is headroom for
 	// audio, RTCP and the burst a key frame creates.
 	simulcastREMBRatio = 9 // out of 10
@@ -216,6 +216,7 @@ type layerSelector struct {
 	lastDrop     time.Time
 	lastSwitch   time.Time
 	stableSince  time.Time
+	waitingSince time.Time
 }
 
 func newLayerSelector(limits []layerLimit, available []string, preferred string, now time.Time) *layerSelector {
@@ -225,6 +226,11 @@ func newLayerSelector(limits []layerLimit, available []string, preferred string,
 		selector.available[rid] = true
 	}
 	selector.current = selector.startLayer(preferred)
+	if selector.rankOf(preferred) >= 0 {
+		// Prefer to start on h even if its first RID packet has not arrived yet:
+		// nextSwitch waits briefly for it, then falls back to what is on the wire.
+		selector.current = preferred
+	}
 	return selector
 }
 
@@ -290,7 +296,19 @@ func (s *layerSelector) setAvailable(rids []string) {
 	if s.waiting && !s.available[s.target] {
 		s.waiting = false
 		s.target = ""
+		s.waitingSince = time.Time{}
 	}
+}
+
+// snapshot reports the layer a subscriber is on and, while a switch is waiting
+// for its key frame, how long that wait has lasted.
+func (s *layerSelector) snapshot(now time.Time) (current string, waiting bool, wait time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.waiting && !s.waitingSince.IsZero() {
+		wait = now.Sub(s.waitingSince)
+	}
+	return s.current, s.waiting, wait
 }
 
 func (s *layerSelector) noteDrop(now time.Time) {
@@ -349,19 +367,17 @@ func (s *layerSelector) nextSwitch(now time.Time) (string, bool) {
 		return "", false
 	}
 	if !s.available[s.current] {
+		// The preferred layer usually appears within milliseconds of the first
+		// probed SSRC; wait for it instead of forwarding f and switching down.
+		if s.current == s.startRID && s.lastSwitch.IsZero() && now.Sub(s.startedAt) < simulcastPreferredWait {
+			return "", false
+		}
 		target := s.fallbackLayer()
 		if target == "" || target == s.current {
 			return "", false
 		}
 		s.beginSwitch(target, now)
 		return target, true
-	}
-	// Align a subscription that was created from a partial RID set (see the
-	// constant). This can be a downgrade: the first probed SSRC is often f.
-	if s.lastSwitch.IsZero() && now.Sub(s.startedAt) < simulcastInitialRampWindow &&
-		s.available[s.startRID] && s.current != s.startRID {
-		s.beginSwitch(s.startRID, now)
-		return s.startRID, true
 	}
 	if !s.lastSwitch.IsZero() && now.Sub(s.lastSwitch) < simulcastSwitchInterval {
 		return "", false
@@ -370,8 +386,7 @@ func (s *layerSelector) nextSwitch(now time.Time) (string, bool) {
 	if wanted == "" || wanted == s.current {
 		return "", false
 	}
-	initialRamp := wanted == s.startRID && s.rankOf(s.current) < s.rankOf(s.startRID)
-	if s.rankOf(wanted) > s.rankOf(s.current) && !initialRamp && now.Sub(s.stableSince) < simulcastGrowAfter {
+	if s.rankOf(wanted) > s.rankOf(s.current) && now.Sub(s.stableSince) < simulcastGrowAfter {
 		return "", false
 	}
 	s.beginSwitch(wanted, now)
@@ -381,6 +396,7 @@ func (s *layerSelector) nextSwitch(now time.Time) (string, bool) {
 func (s *layerSelector) beginSwitch(rid string, now time.Time) {
 	s.target = rid
 	s.waiting = true
+	s.waitingSince = now
 	s.lastSwitch = now
 }
 
@@ -398,6 +414,7 @@ func (s *layerSelector) accept(rid string, keyFrame bool, now time.Time) (send b
 			s.current = rid
 			s.waiting = false
 			s.target = ""
+			s.waitingSince = time.Time{}
 			s.lastSwitch = now
 			s.stableSince = now
 			return true, switched
@@ -414,6 +431,13 @@ func (s *layerSelector) accept(rid string, keyFrame bool, now time.Time) (send b
 		return true, false
 	}
 	return false, false
+}
+
+// currentRID is the layer currently forwarded, even while a switch is waiting.
+func (s *layerSelector) currentRID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.current
 }
 
 // priorityRID is the layer a key frame request should target: the one being

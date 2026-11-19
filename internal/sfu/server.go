@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -246,6 +247,9 @@ func (s *subscriberSink) close() {
 }
 
 func (s *subscriberSink) push(data []byte) {
+	if testDropForwardedPacket() {
+		return
+	}
 	select {
 	case <-s.done:
 		return
@@ -298,6 +302,7 @@ func (s *subscriberSink) pushLayer(rid string, packet *rtp.Packet) {
 		s.layersChecked = now
 		s.selector.setAvailable(s.upstream.simulcast.layerRIDs())
 	}
+	previousRID := s.selector.currentRID()
 	requestRID := ""
 	if target, wanted := s.selector.nextSwitch(now); wanted {
 		requestRID = target
@@ -321,7 +326,7 @@ func (s *subscriberSink) pushLayer(rid string, packet *rtp.Packet) {
 		if s.metrics != nil {
 			s.metrics.simulcastSwitches.Add(1)
 		}
-		slog.Debug("simulcast switch", "track", s.trackID, "subscriber", s.peerID, "to", rid)
+		slog.Debug("simulcast switch", "track", s.trackID, "subscriber", s.peerID, "from", previousRID, "to", rid)
 	}
 	s.rewriter.rewrite(clone)
 	data, err := clone.Marshal()
@@ -344,6 +349,11 @@ func (s *subscriberSink) pushMarshaled(packet *rtp.Packet) {
 }
 
 func (s *subscriberSink) pushMarshaledBytes(data []byte) {
+	if testDropForwardedPacket() {
+		// Real loss, not a full queue: the subscriber reports it in an RR, and
+		// the selector reacts to that report.
+		return
+	}
 	select {
 	case <-s.done:
 		return
@@ -574,6 +584,10 @@ func (s *Server) ControlHandler() http.Handler {
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("GET /v1/capabilities", s.handleCapabilities)
 	mux.HandleFunc("POST /v1/control", s.handleControl)
+	if testLossControl != nil {
+		// Test-only (`-tags simulcastloss`): loopback congestion injector.
+		mux.Handle("POST /v1/test/simulcast-loss", testLossControl)
+	}
 	return mux
 }
 
@@ -670,6 +684,18 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	writeCounter(w, "tarnmedia_key_frames_collapsed_total", s.metrics.keyFramesCollapsed.Load())
 	writeCounter(w, "tarnmedia_simulcast_switches_total", s.metrics.simulcastSwitches.Load())
 	writeCounter(w, "tarnmedia_remb_received_total", s.metrics.rembReceived.Load())
+	layers, waiting, maxWait := s.simulcastState()
+	rids := make([]string, 0, len(layers))
+	for rid := range layers {
+		rids = append(rids, rid)
+	}
+	sort.Strings(rids)
+	_, _ = fmt.Fprintf(w, "# TYPE tarnmedia_simulcast_layer gauge\n")
+	for _, rid := range rids {
+		_, _ = fmt.Fprintf(w, "tarnmedia_simulcast_layer{layer=%q} %d\n", rid, layers[rid])
+	}
+	_, _ = fmt.Fprintf(w, "# TYPE tarnmedia_simulcast_waiting_keyframe gauge\ntarnmedia_simulcast_waiting_keyframe %d\n", waiting)
+	_, _ = fmt.Fprintf(w, "# TYPE tarnmedia_simulcast_wait_seconds gauge\ntarnmedia_simulcast_wait_seconds %.3f\n", maxWait.Seconds())
 }
 
 func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
@@ -790,6 +816,54 @@ func (s *Server) roomAndPeerCount() (int, int) {
 		current.mu.Unlock()
 	}
 	return len(rooms), peers
+}
+
+// simulcastState samples current layer and key-frame wait state for the metrics
+// endpoint. A scrape-time snapshot avoids per-packet bookkeeping in the hot
+// forwarding path and cannot drift from the selectors.
+func (s *Server) simulcastState() (map[string]int, int, time.Duration) {
+	layers := make(map[string]int, len(s.cfg.SimulcastLayers))
+	for _, layer := range s.cfg.SimulcastLayers {
+		layers[layer.RID] = 0
+	}
+	if len(layers) == 0 {
+		for _, layer := range defaultLayerLimits() {
+			layers[layer.rid] = 0
+		}
+	}
+
+	s.mu.RLock()
+	rooms := make([]*room, 0, len(s.rooms))
+	for _, current := range s.rooms {
+		rooms = append(rooms, current)
+	}
+	s.mu.RUnlock()
+
+	now := time.Now()
+	waiting := 0
+	var maxWait time.Duration
+	for _, current := range rooms {
+		current.mu.Lock()
+		for _, byTrack := range current.subscriptions {
+			for _, sink := range byTrack {
+				if sink.selector == nil {
+					continue
+				}
+				layer, isWaiting, wait := sink.selector.snapshot(now)
+				if layer != "" {
+					layers[layer]++
+				}
+				if isWaiting {
+					waiting++
+					if wait > maxWait {
+						maxWait = wait
+					}
+				}
+			}
+		}
+		current.mu.Unlock()
+	}
+	return layers, waiting, maxWait
 }
 
 func (s *Server) closeRoom(roomID string, revokedAt time.Time) int {
@@ -2236,31 +2310,41 @@ func readSubscriberRTCP(sender *webrtc.RTPSender, sink *subscriberSink, metrics 
 		if err != nil {
 			continue
 		}
-		for _, packet := range packets {
-			switch report := packet.(type) {
-			case *rtcp.ReceiverEstimatedMaximumBitrate:
-				if sink.selector != nil && report.Bitrate > 0 {
-					sink.selector.setREMB(uint32(report.Bitrate))
-					if metrics != nil {
-						metrics.rembReceived.Add(1)
-					}
-				}
-			case *rtcp.ReceiverReport:
-				if sink.selector != nil {
-					worst := 0.0
-					for _, reception := range report.Reports {
-						fractionLost := float64(reception.FractionLost) / 256
-						if fractionLost > worst {
-							worst = fractionLost
-						}
-					}
-					sink.selector.noteReport(worst, time.Now())
+		applySubscriberRTCP(packets, sink, metrics)
+	}
+}
+
+// applySubscriberRTCP feeds receiver reports and REMB into layer selection and
+// forwards key-frame requests upstream. It is separate from the socket loop so
+// the loss/REMB paths can be tested with the wire format.
+func applySubscriberRTCP(packets []rtcp.Packet, sink *subscriberSink, metrics *serverMetrics) {
+	if sink == nil {
+		return
+	}
+	for _, packet := range packets {
+		switch report := packet.(type) {
+		case *rtcp.ReceiverEstimatedMaximumBitrate:
+			if sink.selector != nil && report.Bitrate > 0 {
+				sink.selector.setREMB(uint32(report.Bitrate))
+				if metrics != nil {
+					metrics.rembReceived.Add(1)
 				}
 			}
+		case *rtcp.ReceiverReport:
+			if sink.selector != nil {
+				worst := 0.0
+				for _, reception := range report.Reports {
+					fractionLost := float64(reception.FractionLost) / 256
+					if fractionLost > worst {
+						worst = fractionLost
+					}
+				}
+				sink.selector.noteReport(worst, time.Now())
+			}
 		}
-		if sink.video && requestsKeyFrame(packets) {
-			sink.requestKeyFrame(metrics)
-		}
+	}
+	if sink.video && requestsKeyFrame(packets) {
+		sink.requestKeyFrame(metrics)
 	}
 }
 

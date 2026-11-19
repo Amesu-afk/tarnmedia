@@ -427,6 +427,26 @@ func TestLayerSelectorUsesREMBBudget(t *testing.T) {
 	}
 }
 
+func BenchmarkRTPRewriter(b *testing.B) {
+	rewriter := newRTPRewriter(0x01020304)
+	packet := &rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			PayloadType:    96,
+			SequenceNumber: 1,
+			Timestamp:      90_000,
+			SSRC:           0x11223344,
+		},
+		Payload: make([]byte, 1100),
+	}
+	b.SetBytes(int64(packet.MarshalSize()))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		rewriter.rewrite(packet)
+	}
+}
+
 func TestKeyFrameDetection(t *testing.T) {
 	tests := []struct {
 		name    string

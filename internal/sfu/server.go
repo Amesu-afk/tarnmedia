@@ -310,7 +310,7 @@ func (s *subscriberSink) pushLayer(rid string, packet *rtp.Packet) {
 		now.Sub(s.layersChecked) >= simulcastLayerSilence/4 {
 		s.layersVersion = version
 		s.layersChecked = now
-		s.selector.setAvailable(s.upstream.simulcast.layerRIDs())
+		s.selector.setAvailable(s.upstream.simulcast.layerRIDs(), now)
 	}
 	if s.subscriber != nil && s.subscriber.bwe != nil {
 		if target, ok := s.subscriber.bwe.target(now); ok {
@@ -736,13 +736,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	}
 	_, _ = fmt.Fprintf(w, "# TYPE tarnmedia_simulcast_waiting_keyframe gauge\ntarnmedia_simulcast_waiting_keyframe %d\n", waiting)
 	_, _ = fmt.Fprintf(w, "# TYPE tarnmedia_simulcast_wait_seconds gauge\ntarnmedia_simulcast_wait_seconds %.3f\n", maxWait.Seconds())
-	bweActive, bweTarget, twccFeedback := 0, uint32(0), uint64(0)
+	bweActive, bweMin, bweMax, twccFeedback := 0, uint32(0), uint32(0), uint64(0)
 	if s.bwe != nil {
-		bweActive, bweTarget, twccFeedback = s.bwe.snapshot(time.Now())
+		bweActive, bweMin, bweMax, twccFeedback = s.bwe.snapshot(time.Now())
 	}
 	writeCounter(w, "tarnmedia_twcc_received_total", twccFeedback)
 	_, _ = fmt.Fprintf(w, "# TYPE tarnmedia_simulcast_bwe_active gauge\ntarnmedia_simulcast_bwe_active %d\n", bweActive)
-	_, _ = fmt.Fprintf(w, "# TYPE tarnmedia_simulcast_bwe_target_bps gauge\ntarnmedia_simulcast_bwe_target_bps %d\n", bweTarget)
+	_, _ = fmt.Fprintf(w, "# TYPE tarnmedia_simulcast_bwe_target_min_bps gauge\ntarnmedia_simulcast_bwe_target_min_bps %d\n", bweMin)
+	_, _ = fmt.Fprintf(w, "# TYPE tarnmedia_simulcast_bwe_target_bps gauge\ntarnmedia_simulcast_bwe_target_bps %d\n", bweMax)
 }
 
 func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {

@@ -100,7 +100,7 @@ func (f *bweFactory) state(id string) *bweState {
 	return f.states[id]
 }
 
-func (f *bweFactory) snapshot(now time.Time) (active int, maxTarget uint32, feedback uint64) {
+func (f *bweFactory) snapshot(now time.Time) (active int, minTarget, maxTarget uint32, feedback uint64) {
 	f.mu.Lock()
 	states := make([]*bweState, 0, len(f.states))
 	for _, state := range f.states {
@@ -111,12 +111,15 @@ func (f *bweFactory) snapshot(now time.Time) (active int, maxTarget uint32, feed
 		feedback += state.twccCount.Load()
 		if target, ok := state.target(now); ok {
 			active++
+			if minTarget == 0 || target < minTarget {
+				minTarget = target
+			}
 			if target > maxTarget {
 				maxTarget = target
 			}
 		}
 	}
-	return active, maxTarget, feedback
+	return active, minTarget, maxTarget, feedback
 }
 
 // bweInterceptor records outgoing packets in the estimator and feeds it the

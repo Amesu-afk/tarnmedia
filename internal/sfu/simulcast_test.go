@@ -312,7 +312,7 @@ func TestLayerSelectorFallsBackWhenTheCurrentLayerDisappears(t *testing.T) {
 	selector := newLayerSelector(testLayerLimits(), []string{"q", "h", "f"}, "h", now)
 	selector.accept("h", true, now)
 
-	selector.setAvailable([]string{"q", "f"})
+	selector.setAvailable([]string{"q", "f"}, now.Add(simulcastPreferredWait+time.Millisecond))
 	fallbackAt := now.Add(simulcastPreferredWait + time.Millisecond)
 	target, ok := selector.nextSwitch(fallbackAt)
 	if !ok || target != "q" {
@@ -336,7 +336,7 @@ func TestLayerSelectorRampsFromEarlyLowLayerToStartLayer(t *testing.T) {
 	if send, _ := selector.accept("q", true, now.Add(100*time.Millisecond)); send {
 		t.Fatal("q must not be forwarded while the preferred layer is pending")
 	}
-	selector.setAvailable([]string{"q", "h"})
+	selector.setAvailable([]string{"q", "h"}, now.Add(150*time.Millisecond))
 	if send, switched := selector.accept("h", true, now.Add(150*time.Millisecond)); !send || switched {
 		t.Fatalf("h = %t/%t, want true/false", send, switched)
 	}
@@ -386,6 +386,30 @@ func TestLayerSelectorGrowsOnLosslessReportsWithoutREMB(t *testing.T) {
 	}
 	if target, ok = selector.nextSwitch(now.Add(simulcastLayerCooldown + 12*time.Second)); !ok || target != "f" {
 		t.Fatalf("after cooldown target = %q, ok = %t; want f", target, ok)
+	}
+}
+
+func TestLayerSelectorCoolsDownASilentLayer(t *testing.T) {
+	now := time.Unix(4700, 0)
+	selector := newLayerSelector(testLayerLimits(), []string{"q", "h", "f"}, "h", now)
+	selector.accept("h", true, now)
+
+	// h was flowing and then went silent: fall back, but do not flap back the
+	// moment the encoder resumes.
+	silentAt := now.Add(2 * time.Second)
+	selector.setAvailable([]string{"q", "f"}, silentAt)
+	target, ok := selector.nextSwitch(silentAt)
+	if !ok || target != "q" {
+		t.Fatalf("fallback = %q, ok = %t; want q", target, ok)
+	}
+	selector.accept("q", true, silentAt)
+
+	selector.setAvailable([]string{"q", "h", "f"}, silentAt.Add(time.Second))
+	if target, ok := selector.nextSwitch(silentAt.Add(8 * time.Second)); ok {
+		t.Fatalf("silent layer was retried during its cooldown: %q", target)
+	}
+	if target, ok := selector.nextSwitch(silentAt.Add(simulcastSilenceCooldown + time.Second)); !ok || target != "h" {
+		t.Fatalf("after silence cooldown target = %q, ok = %t; want h", target, ok)
 	}
 }
 

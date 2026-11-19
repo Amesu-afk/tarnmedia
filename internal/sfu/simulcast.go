@@ -45,6 +45,10 @@ const (
 	// A layer that had to be abandoned is not retried immediately; otherwise a
 	// link that fits h but not f would pump between them every few seconds.
 	simulcastLayerCooldown = 30 * time.Second
+	// A layer that merely went silent (encoder paused it, or an unstable
+	// transport) is retried sooner, but not instantly: a 2 s pause and a 5 s
+	// resume would otherwise flap the picture.
+	simulcastSilenceCooldown = 10 * time.Second
 	// One 30 fps frame at 90 kHz. Used only to keep the output timeline moving
 	// when the source timestamp jumps to another encoder's clock.
 	simulcastTimestampStep = 3000
@@ -271,7 +275,7 @@ func (s *layerSelector) rankOf(rid string) int {
 
 // setAvailable mirrors the layers that are actually on the wire. A layer can
 // stop without the source disappearing: the browser may pause an encoding.
-func (s *layerSelector) setAvailable(rids []string) {
+func (s *layerSelector) setAvailable(rids []string, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(rids) == len(s.available) {
@@ -286,9 +290,13 @@ func (s *layerSelector) setAvailable(rids []string) {
 			return
 		}
 	}
+	wasCurrentAvailable := s.current != "" && s.available[s.current]
 	s.available = make(map[string]bool, len(rids))
 	for _, rid := range rids {
 		s.available[rid] = true
+	}
+	if wasCurrentAvailable && !s.available[s.current] {
+		s.noteSilenceLocked(now)
 	}
 	if s.current == "" {
 		s.current = s.startLayer("h")
@@ -326,6 +334,17 @@ func (s *layerSelector) noteDropLocked(now time.Time) {
 		s.blockedUntil = now.Add(simulcastLayerCooldown)
 	}
 	s.lastDrop = now
+	s.stableSince = now
+}
+
+// noteSilenceLocked is used when an encoding stops producing packets rather
+// than when the link reports loss. It gets a shorter cooldown so a transiently
+// paused encoder can return, but not fast enough to flap the picture.
+func (s *layerSelector) noteSilenceLocked(now time.Time) {
+	if s.current != "" && s.rankOf(s.current) > 0 {
+		s.blockedAbove = s.current
+		s.blockedUntil = now.Add(simulcastSilenceCooldown)
+	}
 	s.stableSince = now
 }
 

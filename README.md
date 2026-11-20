@@ -8,6 +8,34 @@ TarnMedia forwards media between room participants without transcoding. Your app
 
 It powers calls and voice rooms in [TarnVeil](https://tarnveil.ru) and is available as a standalone server for integration with other applications.
 
+[![CI](https://github.com/Amesu-afk/tarnmedia/actions/workflows/ci.yml/badge.svg)](https://github.com/Amesu-afk/tarnmedia/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph app ["Your application server"]
+        JWT["issues short-lived<br/>HS256 media JWTs"]
+        VAL["validates sessions on join<br/>(fails closed)"]
+    end
+
+    U1["Publisher<br/>(mic · camera · screen)"]
+    U2["Subscribers<br/>(per-subscriber layers)"]
+    SFU["TarnMedia SFU — Go + Pion<br/>WSS signaling :8088 · one UDP media port"]
+    ICE["STUN / TURN<br/>(bring your own)"]
+
+    JWT -->|"media JWT"| U1
+    JWT -->|"media JWT"| U2
+    U1 & U2 -->|"authenticate · offer/answer · trickle ICE"| SFU
+    SFU -->|"validation callback"| VAL
+    U1 <-->|"SRTP: Opus, camera and screen<br/>with RID simulcast q/h/f"| SFU
+    U2 <-->|"SRTP: Opus, camera and screen<br/>with RID simulcast q/h/f"| SFU
+    SFU -.->|"ICE"| ICE
+```
+
+TarnMedia never talks to your database: your application decides who may join which room, expresses that as a short-lived JWT, and re-confirms it on every WebSocket connection. Media is forwarded between participants without transcoding; a slow subscriber drops its own packets instead of stalling others.
+
 ## Status
 
 **Experimental.** It runs in production for one small deployment (rooms of up to

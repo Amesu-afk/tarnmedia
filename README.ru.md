@@ -8,6 +8,34 @@ TarnMedia пересылает медиадорожки между участн�
 
 Сервер обеспечивает звонки и голосовые комнаты [TarnVeil](https://tarnveil.ru) и доступен для самостоятельного развёртывания и подключения к другим приложениям.
 
+[![CI](https://github.com/Amesu-afk/tarnmedia/actions/workflows/ci.yml/badge.svg)](https://github.com/Amesu-afk/tarnmedia/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
+## Архитектура
+
+```mermaid
+flowchart LR
+    subgraph app ["Ваш сервер приложения"]
+        JWT["выдаёт короткоживущие<br/>медиа-JWT (HS256)"]
+        VAL["проверяет сессии при входе<br/>(отказ при сбое)"]
+    end
+
+    U1["Издатель<br/>(микрофон · камера · экран)"]
+    U2["Подписчики<br/>(свой слой каждому)"]
+    SFU["TarnMedia SFU — Go + Pion<br/>сигналинг WSS :8088 · один UDP-порт для медиа"]
+    ICE["STUN / TURN<br/>(свои серверы)"]
+
+    JWT -->|"медиа-JWT"| U1
+    JWT -->|"медиа-JWT"| U2
+    U1 & U2 -->|"аутентификация · offer/answer · trickle ICE"| SFU
+    SFU -->|"проверка сессии"| VAL
+    U1 <-->|"SRTP: Opus, камера и экран,<br/>RID-simulcast q/h/f"| SFU
+    U2 <-->|"SRTP: Opus, камера и экран,<br/>RID-simulcast q/h/f"| SFU
+    SFU -.->|"ICE"| ICE
+```
+
+TarnMedia не обращается к вашей базе: кто и в какую комнату может войти, решает ваше приложение и выражает это короткоживущим JWT, а при каждом WebSocket-соединении подтверждает решение ещё раз. Медиа пересылается между участниками без перекодирования; медленный подписчик теряет свои пакеты, а не останавливает остальных.
+
 ## Статус
 
 **Экспериментальный.** Работает в проде на одном небольшом развёртывании
